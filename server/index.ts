@@ -1,5 +1,5 @@
-
 import 'dotenv/config';
+
 import { setServers } from 'node:dns';
 import { randomInt, randomUUID } from 'node:crypto';
 import express from 'express';
@@ -15,11 +15,8 @@ import {
 } from 'mongodb';
 import type { Complaint, UserRole } from '../src/types';
 
-// Use Google's IPv6 DNS resolvers, which were reachable in the network test.
-setServers([
-  '[2001:4860:4860::8888]',
-  '[2001:4860:4860::8844]',
-]);
+// Configure DNS before MongoDB attempts its SRV lookup.
+setServers(['8.8.8.8']);
 
 declare module 'express-session' {
   interface SessionData {
@@ -69,6 +66,10 @@ app.use((req, res, next) => {
   const allowedOrigins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3001',
+    'http://localhost:3002',
+    'http://127.0.0.1:3002',
   ];
 
   const origin = req.headers.origin;
@@ -238,7 +239,10 @@ app.post('/api/ai/analyze-issue', requireAuth, async (req, res) => {
 
     const imageBuffer = Buffer.from(normalizedBase64, 'base64');
 
-    if (imageBuffer.length === 0 || imageBuffer.length > 5 * 1024 * 1024) {
+    if (
+      imageBuffer.length === 0 ||
+      imageBuffer.length > 5 * 1024 * 1024
+    ) {
       res.status(400).json({
         error: 'Please provide a valid image smaller than 5 MB.',
       });
@@ -292,6 +296,7 @@ Allowed categories:
 - Open Manholes
 - Water Leaks
 - Debris & Floods
+- Unrelated
 
 Allowed severity values:
 - Low
@@ -306,7 +311,8 @@ Return one valid JSON object with exactly these fields:
   "observations": ["brief visible observation"],
   "suggestedDescription": "short factual draft based on the image",
   "recommendedAction": "reasonable next step for the citizen or authority",
-  "limitations": "what cannot be confirmed from this image"
+  "limitations": "what cannot be confirmed from this image",
+  "isRelevant": true
 }
 
 Rules:
@@ -315,36 +321,85 @@ Rules:
 - Do not invent a location, measurements, damage depth, cause, or repair status.
 - Do not claim an image is genuine or that an issue has been verified.
 - Do not decide that an issue is an emergency solely from the image.
-- If the image is unclear or unrelated, say so in observations and limitations.
 - Severity is only a preliminary suggestion and requires human review.
+- If the image is unclear or unrelated, say so in observations and limitations.
+- For unrelated images, set suggestedCategory to "Unrelated" and isRelevant to false.
+- For relevant infrastructure images, set isRelevant to true.
 - Return JSON only, with no Markdown fences.
 
 Citizen's description:
 ${description || '(No description provided)'}
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            { text: prompt },
+    const modelsToTry = [
+      'gemini-3.8-flash',
+      'gemini-3.7-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash-lite',
+    ];
+
+    let response: Awaited<
+      ReturnType<typeof ai.models.generateContent>
+    > | undefined;
+
+    let lastGeminiError: unknown;
+
+    for (const model of modelsToTry) {
+      try {
+        console.log(`Trying Gemini model: ${model}`);
+
+        response = await ai.models.generateContent({
+          model,
+          contents: [
             {
-              inlineData: {
-                mimeType: normalizedMimeType,
-                data: normalizedBase64,
-              },
+              role: 'user',
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: normalizedMimeType,
+                    data: normalizedBase64,
+                  },
+                },
+              ],
             },
           ],
-        },
-      ],
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.2,
-        maxOutputTokens: 800,
-      },
-    });
+          config: {
+            responseMimeType: 'application/json',
+            temperature: 0.2,
+            maxOutputTokens: 800,
+          },
+        });
+
+        console.log(`Gemini analysis succeeded with ${model}.`);
+        break;
+      } catch (error: unknown) {
+        lastGeminiError = error;
+
+        const status =
+          typeof error === 'object' &&
+          error !== null &&
+          'status' in error
+            ? Number(error.status)
+            : 0;
+
+        console.error(
+          `Gemini model ${model} failed with status ${status}.`,
+        );
+
+        if (![429, 500, 502, 503, 504].includes(status)) {
+          throw error;
+        }
+      }
+    }
+
+    if (!response) {
+      throw lastGeminiError instanceof Error
+        ? lastGeminiError
+        : new Error(
+            'All configured Gemini models failed. Please try again later.',
+          );
+    }
 
     const responseText = response.text;
 
@@ -362,6 +417,7 @@ ${description || '(No description provided)'}
       suggestedDescription?: unknown;
       recommendedAction?: unknown;
       limitations?: unknown;
+      isRelevant?: unknown;
     };
 
     try {
@@ -381,6 +437,7 @@ ${description || '(No description provided)'}
       'Open Manholes',
       'Water Leaks',
       'Debris & Floods',
+      'Unrelated',
     ];
 
     const allowedSeverities = [
@@ -401,10 +458,22 @@ ${description || '(No description provided)'}
       ) ||
       typeof analysis.suggestedDescription !== 'string' ||
       typeof analysis.recommendedAction !== 'string' ||
-      typeof analysis.limitations !== 'string'
+      typeof analysis.limitations !== 'string' ||
+      typeof analysis.isRelevant !== 'boolean'
     ) {
       res.status(502).json({
         error: 'The AI returned an unexpected response. Please try again.',
+      });
+      return;
+    }
+
+    if (
+      !analysis.isRelevant ||
+      analysis.suggestedCategory === 'Unrelated'
+    ) {
+      res.status(422).json({
+        error: 'This image does not appear to show a supported civic infrastructure issue. Please upload a relevant image.',
+        rejected: true,
       });
       return;
     }
@@ -422,15 +491,57 @@ ${description || '(No description provided)'}
       message:
         'AI suggestions only. Confirm the details before submitting your report.',
     });
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('Gemini issue analysis failed:', error);
 
+    const details =
+      error instanceof Error ? error.message : String(error);
+
     res.status(502).json({
-      error:
-        'Gemini analysis failed. Check your API key, model access, quota, and network connection.',
+      error: 'Gemini image analysis failed.',
+      details,
     });
   }
 });
+
+type ResolutionEstimate = {
+  earliestAt: string;
+  latestAt: string;
+  minDays: number;
+  maxDays: number;
+  basis: string;
+  disclaimer: string;
+};
+
+function createResolutionEstimate(
+  severity: string,
+  reportedAt: string,
+): ResolutionEstimate {
+  // Illustrative prototype ranges only; these are not municipal service targets.
+  const ranges: Record<string, { minDays: number; maxDays: number }> = {
+    Critical: { minDays: 1, maxDays: 3 },
+    High: { minDays: 3, maxDays: 7 },
+    Medium: { minDays: 7, maxDays: 14 },
+    Low: { minDays: 14, maxDays: 30 },
+  };
+
+  const range = ranges[severity] ?? ranges.Medium;
+  const reportedDate = new Date(reportedAt);
+  const earliest = new Date(reportedDate);
+  earliest.setUTCDate(earliest.getUTCDate() + range.minDays);
+  const latest = new Date(reportedDate);
+  latest.setUTCDate(latest.getUTCDate() + range.maxDays);
+
+  return {
+    earliestAt: earliest.toISOString(),
+    latestAt: latest.toISOString(),
+    minDays: range.minDays,
+    maxDays: range.maxDays,
+    basis: `Illustrative planning range based on the citizen-selected ${severity.toLowerCase()} severity.`,
+    disclaimer:
+      'This is an estimate for demonstration only. It is not based on municipal service-level data, does not confirm authority acceptance, and is not a guaranteed repair deadline.',
+  };
+}
 
 // Health check.
 app.get('/api/health', (_req, res) => {
@@ -780,6 +891,7 @@ app.post('/api/complaints', requireAuth, async (req, res) => {
     }
 
     const now = new Date().toISOString();
+    const resolutionEstimate = createResolutionEstimate(body.severity!, now);
 
     const newComplaint = {
       id,
@@ -796,6 +908,7 @@ app.post('/api/complaints', requireAuth, async (req, res) => {
       },
       reportedAt: now,
       updatedAt: now,
+      resolutionEstimate,
       citizenName: user.name,
       citizenPhoneMasked: undefined,
       evidence: body.evidence,

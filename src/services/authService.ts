@@ -1,7 +1,7 @@
 
 import { UserProfile, UserRole } from '../types';
 
-const API_BASE_URL = 'http://localhost:4000/api';
+const API_BASE_URL = '/api';
 
 interface AuthResponse {
   user?: UserProfile;
@@ -58,12 +58,10 @@ function extractUser(data: AuthResponse): UserProfile {
 }
 
 export const authService = {
-  // No user is assumed to be signed in on a fresh page load.
   getCurrentUser(): UserProfile | null {
     return null;
   },
 
-  // Ask the backend whether this browser has a valid session.
   async restoreSession(): Promise<UserProfile | null> {
     try {
       const data = await request<AuthResponse>('/auth/me');
@@ -76,12 +74,10 @@ export const authService = {
         throw error;
       }
 
-      // No valid session is normal when the user is signed out.
       return null;
     }
   },
 
-  // Public registration always creates a citizen account.
   async signUp(
     name: string,
     email: string,
@@ -103,7 +99,6 @@ export const authService = {
     return extractUser(data);
   },
 
-  // The backend verifies the password and creates the session.
   async signIn(email: string, password: string): Promise<UserProfile> {
     const data = await request<AuthResponse>('/auth/login', {
       method: 'POST',
@@ -116,23 +111,20 @@ export const authService = {
     return extractUser(data);
   },
 
-  // End the server session and clear the session cookie.
   async signOut(): Promise<void> {
     await request<{ message?: string }>('/auth/logout', {
       method: 'POST',
     });
   },
 
-  // Role changes must come from an authenticated server account,
-  // not from changing a browser-side user object.
   switchRole(_role: UserRole): UserProfile {
     throw new Error(
       'Role switching is disabled. Sign in using an authorized account.'
     );
   },
 
-  // Kept temporarily for compatibility with existing callers.
   setCurrentUser(_user: UserProfile): void {
     // Authentication state is managed by the backend session.
   },
 };
+

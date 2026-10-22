@@ -16,10 +16,15 @@ export default defineConfig(() => ({
   },
 
   server: {
-    // HMR can be disabled in AI Studio when required.
-    hmr: process.env.DISABLE_HMR !== 'true',
+    host: '0.0.0.0',
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:4000',
+        changeOrigin: true,
+      },
+    },
 
-    // Disable file watching only when explicitly requested.
+    hmr: process.env.DISABLE_HMR !== 'true',
     watch: process.env.DISABLE_HMR === 'true' ? null : {},
   },
 }));
