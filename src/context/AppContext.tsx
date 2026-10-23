@@ -121,15 +121,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
     void refreshComplaints();
   }, [refreshComplaints]);
 
-  // Privileged roles cannot be selected by changing the frontend view.
+  // Switch demonstration roles for judges and prototype demonstration
   const switchRole = useCallback(
-    (role: UserRole) => {
-      showToast(
-        `Switching to ${role} is disabled. Sign in with an authorized account instead.`,
-        'error'
-      );
+    async (role: UserRole) => {
+      try {
+        const user = await authService.demoLogin(role);
+        setCurrentUser(user);
+
+        const workspaceByRole: Record<UserRole, string> = {
+          citizen: 'citizen-dashboard',
+          authority: 'authority',
+          field_crew: 'field-team',
+          admin: 'admin',
+        };
+
+        const targetTab = workspaceByRole[user.role] || 'citizen-dashboard';
+        setActiveNavTab(targetTab);
+        showToast(
+          `Switched active session to demo ${user.role}: ${user.name}`,
+          'success'
+        );
+      } catch (error) {
+        showToast(
+          error instanceof Error
+            ? error.message
+            : `Unable to switch to demonstration ${role} account.`,
+          'error'
+        );
+      }
     },
-    [showToast]
+    [showToast, setActiveNavTab]
   );
 
   const dismissToast = useCallback((id: number) => {

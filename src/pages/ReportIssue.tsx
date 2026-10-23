@@ -480,22 +480,26 @@ export const ReportIssue: React.FC<ReportIssueProps> = ({
 
       const result = (await response.json().catch(() => ({}))) as {
         id?: string;
+        complaint?: { id: string };
         error?: string;
+        message?: string;
       };
 
       if (!response.ok) {
         throw new Error(
-          result.error || 'The report could not be saved. Please try again.',
+          result.error || result.message || 'The report could not be saved. Please try again.',
         );
       }
 
-      if (!result.id) {
+      const returnedId = result.id || result.complaint?.id;
+
+      if (!returnedId) {
         throw new Error('The server did not return a complaint tracking ID.');
       }
 
-      setSubmittedId(result.id);
+      setSubmittedId(returnedId);
       await refreshComplaints();
-      showToast(`Report saved. Tracking ID: ${result.id}`, 'success');
+      showToast(`Report saved. Tracking ID: ${returnedId}`, 'success');
     } catch (error) {
       const message =
         error instanceof Error

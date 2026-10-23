@@ -1,40 +1,48 @@
 import 'dotenv/config';
 
-import { setServers } from 'node:dns';
-import { randomInt, randomUUID } from 'node:crypto';
-import express from 'express';
-import type { RequestHandler } from 'express';
+import dns from 'node:dns';
+dns.setServers(['1.1.1.1', '8.8.8.8']);
+import crypto from 'node:crypto';
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from 'express';
+import cors from 'cors';
 import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import bcrypt from 'bcryptjs';
-import { GoogleGenAI } from '@google/genai';
 import {
   MongoClient,
-  Collection,
-  Document,
+  type Db,
 } from 'mongodb';
-import type { Complaint, UserRole } from '../src/types';
 
-// Configure DNS before MongoDB attempts its SRV lookup.
-setServers(['8.8.8.8']);
+import type {
+  Complaint,
+  ComplaintStatus,
+  UserRole,
+} from '../src/types';
+import { DEMO_USERS, INITIAL_COMPLAINTS } from '../src/data/demoData';
 
-declare module 'express-session' {
-  interface SessionData {
-    userId?: string;
-  }
-}
+dns.setDefaultResultOrder('ipv4first');
 
-interface UserDocument extends Document {
-  id: string;
-  name: string;
-  email: string;
-  passwordHash: string;
-  role: UserRole;
-  ward?: string;
-  department?: string;
-  phone?: string;
-  createdAt: string;
-}
+const app = express();
+
+const PORT = Number(process.env.PORT || 4000);
+const MONGODB_URI = process.env.MONGODB_URI;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+const DATABASE_NAME = 'roadwatch';
+
+const ALLOWED_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:3002',
+];
 
 interface PublicUser {
   id: string;
@@ -46,92 +54,159 @@ interface PublicUser {
   phone?: string;
 }
 
-const app = express();
-const PORT = Number(process.env.PORT) || 4000;
-const MONGODB_URI = process.env.MONGODB_URI;
-const SESSION_SECRET = process.env.SESSION_SECRET;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const SESSION_COOKIE = 'roadwatch.sid';
-
-app.disable('x-powered-by');
-
-if (IS_PRODUCTION) {
-  app.set('trust proxy', 1);
+interface UserDocument {
+  id: string;
+  name: string;
+  email: string;
+  passwordHash: string;
+  role: UserRole;
+  ward?: string;
+  department?: string;
+  phone?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
-app.use(express.json({ limit: '8mb' }));
+interface ComplaintComment {
+  id: string;
+  author: string;
+  role: string;
+  text: string;
+  timestamp: string;
+}
 
-app.use((req, res, next) => {
-  const allowedOrigins = [
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'http://localhost:3001',
-    'http://127.0.0.1:3001',
-    'http://localhost:3002',
-    'http://127.0.0.1:3002',
-  ];
+interface ComplaintDocument {
+  id: string;
+  title: string;
+  category: string;
+  description: string;
+  severity: string;
+  status: string;
+  ward: string;
+  locationName: string;
+  coordinates: {
+    lat: number;
+    lng: number;
+  };
+  reportedAt: string;
+  updatedAt: string;
+  citizenName: string;
+  citizenPhoneMasked?: string;
+  assignedCrew?: string;
+  workNotes?: string;
+  materialDetails?: string;
+  evidence?: Record<string, unknown>;
+  feedback?: Record<string, unknown>;
+  endorsementsCount?: number;
+  commentsCount?: number;
+  comments?: ComplaintComment[];
+  [key: string]: any;
+}
 
-  const origin = req.headers.origin;
+/*
+ * MongoDB's generic update types can reject valid nested $push updates
+ * when the document interface contains optional arrays.
+ *
+ * This collection type keeps the update operations usable while the
+ * application validates request data before writing to MongoDB.
+ */
+type ComplaintCollection = {
+  findOne: (...args: any[]) => Promise<any>;
+  find: (...args: any[]) => any;
+  insertOne: (...args: any[]) => Promise<any>;
+  updateOne: (...args: any[]) => Promise<any>;
+  deleteMany: (...args: any[]) => Promise<any>;
+  createIndex: (...args: any[]) => Promise<any>;
+};
 
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+type UserCollection = {
+  findOne: (...args: any[]) => Promise<any>;
+  insertOne: (...args: any[]) => Promise<any>;
+  createIndex: (...args: any[]) => Promise<any>;
+};
+
+declare module 'express-session' {
+  interface SessionData {
+    user?: PublicUser;
   }
+}
 
-  res.setHeader('Vary', 'Origin');
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-  );
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization',
-  );
+let mongoClient: MongoClient | undefined;
+let database: Db | undefined;
+let usersCollection: UserCollection | undefined;
+let complaintsCollection: ComplaintCollection | undefined;
+let sessionMiddleware: express.RequestHandler | undefined;
 
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(204);
-    return;
-  }
+const SESSION_COOKIE_NAME = 'roadwatch.sid';
 
-  next();
-});
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
 
-let usersCollection: Collection<UserDocument> | undefined;
-let complaintsCollection: Collection<Document> | undefined;
-let sessionMiddleware: RequestHandler | undefined;
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+        return;
+      }
 
-app.use((req, res, next) => {
+      callback(new Error('Origin not allowed by CORS.'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  }),
+);
+
+app.use(express.json({ limit: '12mb' }));
+app.use(express.urlencoded({ extended: true, limit: '12mb' }));
+
+app.use((req: Request, res: Response, next: NextFunction) => {
   if (!sessionMiddleware) {
-    res.status(503).json({ error: 'Session service is not ready.' });
+    res.status(503).json({
+      success: false,
+      message: 'Server session service is initializing. Please retry in a moment.',
+    });
     return;
   }
-
   sessionMiddleware(req, res, next);
 });
 
-function publicUser(user: UserDocument): PublicUser {
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    ward: user.ward,
-    department: user.department,
-    phone: user.phone,
-  };
-}
-
-const requireAuth: RequestHandler = (req, res, next) => {
-  if (!req.session.userId) {
-    res.status(401).json({ error: 'Please sign in first.' });
-    return;
+function getUsersCollection(): UserCollection {
+  if (!usersCollection) {
+    throw new Error('The user database is not initialized.');
   }
 
-  next();
-};
+  return usersCollection;
+}
 
-function validText(value: unknown, maxLength: number): value is string {
+function getComplaintsCollection(): ComplaintCollection {
+  if (!complaintsCollection) {
+    throw new Error('The complaint database is not initialized.');
+  }
+
+  return complaintsCollection;
+}
+
+function createId(prefix: string): string {
+  return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function createComplaintId(): string {
+  const year = new Date().getFullYear();
+  return `RW-${year}-${crypto.randomInt(1000, 9999)}`;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : 'An unexpected server error occurred.';
+}
+
+function isValidString(
+  value: unknown,
+  maxLength = 5000,
+): value is string {
   return (
     typeof value === 'string' &&
     value.trim().length > 0 &&
@@ -139,875 +214,1530 @@ function validText(value: unknown, maxLength: number): value is string {
   );
 }
 
-// Gemini AI image analysis for signed-in citizens.
-// Suggestions do not verify a real-world issue.
-app.post('/api/ai/analyze-issue', requireAuth, async (req, res) => {
-  if (!usersCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
-
-  if (!GEMINI_API_KEY) {
-    res.status(503).json({
-      error: 'Gemini AI is not configured on the server.',
-    });
-    return;
-  }
-
-  try {
-    const user = await usersCollection.findOne({
-      id: req.session.userId,
-    });
-
-    if (!user) {
-      res.status(401).json({ error: 'Please sign in again.' });
-      return;
-    }
-
-    if (user.role !== 'citizen') {
-      res.status(403).json({
-        error: 'Only citizen accounts can request report analysis.',
-      });
-      return;
-    }
-
-    const {
-      imageBase64,
-      mimeType,
-      reportDescription,
-    } = req.body ?? {};
-
-    if (
-      typeof imageBase64 !== 'string' ||
-      imageBase64.length === 0 ||
-      imageBase64.length > 7_000_000
-    ) {
-      res.status(400).json({
-        error: 'Please provide an image smaller than 5 MB.',
-      });
-      return;
-    }
-
-    const allowedMimeTypes = [
-      'image/jpeg',
-      'image/png',
-      'image/webp',
-    ];
-
-    if (
-      typeof mimeType !== 'string' ||
-      !allowedMimeTypes.includes(mimeType)
-    ) {
-      res.status(400).json({
-        error: 'Use a JPEG, PNG, or WebP image.',
-      });
-      return;
-    }
-
-    if (
-      reportDescription !== undefined &&
-      (typeof reportDescription !== 'string' ||
-        reportDescription.length > 2000)
-    ) {
-      res.status(400).json({
-        error: 'The report description must be under 2000 characters.',
-      });
-      return;
-    }
-
-    let normalizedBase64 = imageBase64;
-    let normalizedMimeType = mimeType;
-
-    const dataUrlMatch = imageBase64.match(
-      /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/s,
-    );
-
-    if (dataUrlMatch) {
-      normalizedMimeType = dataUrlMatch[1];
-      normalizedBase64 = dataUrlMatch[2];
-    }
-
-    if (
-      !/^[A-Za-z0-9+/]+={0,2}$/.test(normalizedBase64) ||
-      normalizedBase64.length % 4 !== 0
-    ) {
-      res.status(400).json({
-        error: 'The uploaded image data is invalid.',
-      });
-      return;
-    }
-
-    const imageBuffer = Buffer.from(normalizedBase64, 'base64');
-
-    if (
-      imageBuffer.length === 0 ||
-      imageBuffer.length > 5 * 1024 * 1024
-    ) {
-      res.status(400).json({
-        error: 'Please provide a valid image smaller than 5 MB.',
-      });
-      return;
-    }
-
-    const isJpeg =
-      imageBuffer[0] === 0xff &&
-      imageBuffer[1] === 0xd8 &&
-      imageBuffer[2] === 0xff;
-
-    const isPng =
-      imageBuffer.length >= 8 &&
-      imageBuffer.subarray(0, 8).equals(
-        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-      );
-
-    const isWebp =
-      imageBuffer.length >= 12 &&
-      imageBuffer.toString('ascii', 0, 4) === 'RIFF' &&
-      imageBuffer.toString('ascii', 8, 12) === 'WEBP';
-
-    const signatureMatches =
-      (normalizedMimeType === 'image/jpeg' && isJpeg) ||
-      (normalizedMimeType === 'image/png' && isPng) ||
-      (normalizedMimeType === 'image/webp' && isWebp);
-
-    if (!signatureMatches) {
-      res.status(400).json({
-        error: 'The image contents do not match the selected file type.',
-      });
-      return;
-    }
-
-    const description =
-      typeof reportDescription === 'string'
-        ? reportDescription.trim()
-        : '';
-
-    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-    const prompt = `
-You assist citizens with drafting civic infrastructure reports.
-
-Inspect the supplied image and optional citizen description.
-
-Allowed categories:
-- Potholes
-- Streetlights
-- Drainage
-- Open Manholes
-- Water Leaks
-- Debris & Floods
-- Unrelated
-
-Allowed severity values:
-- Low
-- Medium
-- High
-- Critical
-
-Return one valid JSON object with exactly these fields:
-{
-  "suggestedCategory": "one allowed category",
-  "suggestedSeverity": "one allowed severity",
-  "observations": ["brief visible observation"],
-  "suggestedDescription": "short factual draft based on the image",
-  "recommendedAction": "reasonable next step for the citizen or authority",
-  "limitations": "what cannot be confirmed from this image",
-  "isRelevant": true
+function isValidRole(value: unknown): value is UserRole {
+  return (
+    value === 'citizen' ||
+    value === 'authority' ||
+    value === 'field_crew' ||
+    value === 'admin'
+  );
 }
 
-Rules:
-- Only describe details that are visibly supported by the image.
-- Consider the citizen description as context, not proof.
-- Do not invent a location, measurements, damage depth, cause, or repair status.
-- Do not claim an image is genuine or that an issue has been verified.
-- Do not decide that an issue is an emergency solely from the image.
-- Severity is only a preliminary suggestion and requires human review.
-- If the image is unclear or unrelated, say so in observations and limitations.
-- For unrelated images, set suggestedCategory to "Unrelated" and isRelevant to false.
-- For relevant infrastructure images, set isRelevant to true.
-- Return JSON only, with no Markdown fences.
+function publicUser(user: UserDocument): PublicUser {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    ...(user.ward ? { ward: user.ward } : {}),
+    ...(user.department ? { department: user.department } : {}),
+    ...(user.phone ? { phone: user.phone } : {}),
+  };
+}
 
-Citizen's description:
-${description || '(No description provided)'}
-`;
+function requireAuthentication(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!req.session.user) {
+    res.status(401).json({
+      success: false,
+      message: 'Please log in to continue.',
+    });
+    return;
+  }
 
-    const modelsToTry = [
-      'gemini-3.8-flash',
-      'gemini-3.7-flash',
-      'gemini-3.6-flash',
-      'gemini-3.5-flash-lite',
-    ];
+  next();
+}
 
-    let response: Awaited<
-      ReturnType<typeof ai.models.generateContent>
-    > | undefined;
+function requireRoles(...roles: UserRole[]) {
+  return (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): void => {
+    const user = req.session.user;
 
-    let lastGeminiError: unknown;
-
-    for (const model of modelsToTry) {
-      try {
-        console.log(`Trying Gemini model: ${model}`);
-
-        response = await ai.models.generateContent({
-          model,
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                { text: prompt },
-                {
-                  inlineData: {
-                    mimeType: normalizedMimeType,
-                    data: normalizedBase64,
-                  },
-                },
-              ],
-            },
-          ],
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.2,
-            maxOutputTokens: 800,
-          },
-        });
-
-        console.log(`Gemini analysis succeeded with ${model}.`);
-        break;
-      } catch (error: unknown) {
-        lastGeminiError = error;
-
-        const status =
-          typeof error === 'object' &&
-          error !== null &&
-          'status' in error
-            ? Number(error.status)
-            : 0;
-
-        console.error(
-          `Gemini model ${model} failed with status ${status}.`,
-        );
-
-        if (![429, 500, 502, 503, 504].includes(status)) {
-          throw error;
-        }
-      }
-    }
-
-    if (!response) {
-      throw lastGeminiError instanceof Error
-        ? lastGeminiError
-        : new Error(
-            'All configured Gemini models failed. Please try again later.',
-          );
-    }
-
-    const responseText = response.text;
-
-    if (!responseText) {
-      res.status(502).json({
-        error: 'Gemini did not return an analysis. Please try again.',
+    if (!user) {
+      res.status(401).json({
+        success: false,
+        message: 'Please log in to continue.',
       });
       return;
     }
 
-    let analysis: {
-      suggestedCategory?: unknown;
-      suggestedSeverity?: unknown;
-      observations?: unknown;
-      suggestedDescription?: unknown;
-      recommendedAction?: unknown;
-      limitations?: unknown;
-      isRelevant?: unknown;
-    };
+    if (!roles.includes(user.role)) {
+      res.status(403).json({
+        success: false,
+        message: 'You do not have permission to perform this action.',
+      });
+      return;
+    }
 
+    next();
+  };
+}
+
+function makeComment(
+  author: string,
+  role: string,
+  text: string,
+): ComplaintComment {
+  return {
+    id: crypto.randomUUID(),
+    author,
+    role,
+    text,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function cleanComplaint(
+  complaint: Record<string, any>,
+): Record<string, any> {
+  const { _id, ...cleaned } = complaint;
+  return cleaned;
+}
+
+function parseImageData(
+  value: unknown,
+): { mimeType: string; base64: string } | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const match = value.match(
+    /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/,
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const mimeType = match[1];
+  const base64 = match[2];
+
+  let bytes: Buffer;
+
+  try {
+    bytes = Buffer.from(base64, 'base64');
+  } catch {
+    return null;
+  }
+
+  if (bytes.length === 0 || bytes.length > 8 * 1024 * 1024) {
+    return null;
+  }
+
+  const validSignature =
+    (mimeType === 'image/jpeg' &&
+      bytes.length >= 3 &&
+      bytes[0] === 0xff &&
+      bytes[1] === 0xd8 &&
+      bytes[2] === 0xff) ||
+    (mimeType === 'image/png' &&
+      bytes.length >= 8 &&
+      bytes.subarray(0, 8).equals(
+        Buffer.from([
+          0x89, 0x50, 0x4e, 0x47,
+          0x0d, 0x0a, 0x1a, 0x0a,
+        ]),
+      )) ||
+    (mimeType === 'image/webp' &&
+      bytes.length >= 12 &&
+      bytes.toString('ascii', 0, 4) === 'RIFF' &&
+      bytes.toString('ascii', 8, 12) === 'WEBP');
+
+  if (!validSignature) {
+    return null;
+  }
+
+  return { mimeType, base64 };
+}
+
+/* ------------------------------ Health ------------------------------ */
+
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    service: 'RoadWatch API',
+    database: database ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/* -------------------------- Authentication -------------------------- */
+
+app.post(
+  '/api/auth/register',
+  async (req: Request, res: Response): Promise<void> => {
     try {
-      analysis = JSON.parse(responseText);
-    } catch {
-      console.error('Gemini returned invalid JSON.');
-      res.status(502).json({
-        error: 'The AI response could not be processed. Please try again.',
+      const { name, email, password, role } = req.body ?? {};
+
+      if (!isValidString(name, 100)) {
+        res.status(400).json({
+          success: false,
+          message: 'Enter a valid name.',
+        });
+        return;
+      }
+
+      if (
+        !isValidString(email, 254) ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Enter a valid email address.',
+        });
+        return;
+      }
+
+      if (
+        typeof password !== 'string' ||
+        password.length < 8 ||
+        password.length > 128
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Password must contain 8 to 128 characters.',
+        });
+        return;
+      }
+
+      /*
+       * Public registration supports citizen and municipal authority demo accounts.
+       */
+      const selectedRole: UserRole = role === 'authority' ? 'authority' : 'citizen';
+
+      const users = getUsersCollection();
+      const normalizedEmail = email.trim().toLowerCase();
+
+      const existingUser = await users.findOne({
+        email: normalizedEmail,
       });
-      return;
-    }
 
-    const allowedCategories = [
-      'Potholes',
-      'Streetlights',
-      'Drainage',
-      'Open Manholes',
-      'Water Leaks',
-      'Debris & Floods',
-      'Unrelated',
-    ];
+      if (existingUser) {
+        res.status(409).json({
+          success: false,
+          message: 'An account with this email already exists.',
+        });
+        return;
+      }
 
-    const allowedSeverities = [
-      'Low',
-      'Medium',
-      'High',
-      'Critical',
-    ];
+      const now = new Date().toISOString();
 
-    if (
-      typeof analysis.suggestedCategory !== 'string' ||
-      !allowedCategories.includes(analysis.suggestedCategory) ||
-      typeof analysis.suggestedSeverity !== 'string' ||
-      !allowedSeverities.includes(analysis.suggestedSeverity) ||
-      !Array.isArray(analysis.observations) ||
-      !analysis.observations.every(
-        (item) => typeof item === 'string',
-      ) ||
-      typeof analysis.suggestedDescription !== 'string' ||
-      typeof analysis.recommendedAction !== 'string' ||
-      typeof analysis.limitations !== 'string' ||
-      typeof analysis.isRelevant !== 'boolean'
-    ) {
-      res.status(502).json({
-        error: 'The AI returned an unexpected response. Please try again.',
+      const user: UserDocument = {
+        id: createId('USR'),
+        name: name.trim(),
+        email: normalizedEmail,
+        passwordHash: await bcrypt.hash(password, 12),
+        role: selectedRole,
+        ...(req.body.ward && isValidString(req.body.ward, 100) ? { ward: req.body.ward.trim() } : {}),
+        ...(req.body.phone && isValidString(req.body.phone, 30) ? { phone: req.body.phone.trim() } : {}),
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await users.insertOne(user);
+
+      req.session.user = publicUser(user);
+
+      res.status(201).json({
+        success: true,
+        user: publicUser(user),
+        message: 'Account created successfully.',
       });
-      return;
-    }
+    } catch (error) {
+      console.error('Registration error:', error);
 
-    if (
-      !analysis.isRelevant ||
-      analysis.suggestedCategory === 'Unrelated'
-    ) {
-      res.status(422).json({
-        error: 'This image does not appear to show a supported civic infrastructure issue. Please upload a relevant image.',
-        rejected: true,
+      res.status(500).json({
+        success: false,
+        message: 'Unable to create the account.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/api/auth/demo-login',
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { role, email } = req.body ?? {};
+
+      const demoEmailByRole: Record<string, string> = {
+        citizen: 'ananya.sharma@domain.in',
+        authority: 's.nambiar@ward112.gov.in',
+        field_crew: 'crew.bravo@roadscorp.org',
+        admin: 'admin@roadwatch.demo',
+      };
+
+      let targetEmail: string | undefined;
+
+      if (typeof email === 'string' && Object.values(demoEmailByRole).includes(email.trim().toLowerCase())) {
+        targetEmail = email.trim().toLowerCase();
+      } else if (typeof role === 'string' && demoEmailByRole[role]) {
+        targetEmail = demoEmailByRole[role];
+      }
+
+      if (!targetEmail) {
+        res.status(400).json({
+          success: false,
+          message: 'Specify a valid demonstration role: citizen, authority, field_crew, or admin.',
+        });
+        return;
+      }
+
+      const users = getUsersCollection();
+      const user = (await users.findOne({
+        email: targetEmail,
+      })) as UserDocument | null;
+
+      if (!user) {
+        res.status(404).json({
+          success: false,
+          message: 'Demonstration account was not found in the database.',
+        });
+        return;
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        req.session.regenerate((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+
+      req.session.user = publicUser(user);
+
+      res.json({
+        success: true,
+        user: publicUser(user),
+        message: `Signed in as demonstration ${user.role} (${user.name}).`,
+      });
+    } catch (error) {
+      console.error('Demo login error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to sign in as demo account.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/api/auth/login',
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { email, password } = req.body ?? {};
+
+      if (
+        !isValidString(email, 254) ||
+        typeof password !== 'string' ||
+        password.length === 0
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Enter your email and password.',
+        });
+        return;
+      }
+
+      const users = getUsersCollection();
+
+      const user = (await users.findOne({
+        email: email.trim().toLowerCase(),
+      })) as UserDocument | null;
+
+      if (
+        !user ||
+        !(await bcrypt.compare(password, user.passwordHash))
+      ) {
+        res.status(401).json({
+          success: false,
+          message: 'Invalid email or password.',
+        });
+        return;
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        req.session.regenerate((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve();
+        });
+      });
+
+      req.session.user = publicUser(user);
+
+      res.json({
+        success: true,
+        user: publicUser(user),
+        message: 'Login successful.',
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to log in.',
+      });
+    }
+  },
+);
+
+app.get(
+  '/api/auth/me',
+  (req: Request, res: Response): void => {
+    if (!req.session.user) {
+      res.status(401).json({
+        success: false,
+        message: 'You are not logged in.',
       });
       return;
     }
 
     res.json({
-      analysis: {
-        suggestedCategory: analysis.suggestedCategory,
-        suggestedSeverity: analysis.suggestedSeverity,
-        observations: analysis.observations.slice(0, 6),
-        suggestedDescription: analysis.suggestedDescription,
-        recommendedAction: analysis.recommendedAction,
-        limitations: analysis.limitations,
-      },
-      requiresHumanReview: true,
-      message:
-        'AI suggestions only. Confirm the details before submitting your report.',
+      success: true,
+      user: req.session.user,
     });
-  } catch (error: unknown) {
-    console.error('Gemini issue analysis failed:', error);
+  },
+);
 
-    const details =
-      error instanceof Error ? error.message : String(error);
+app.post(
+  '/api/auth/logout',
+  (req: Request, res: Response): void => {
+    req.session.destroy((error) => {
+      if (error) {
+        res.status(500).json({
+          success: false,
+          message: 'Unable to log out.',
+        });
+        return;
+      }
 
-    res.status(502).json({
-      error: 'Gemini image analysis failed.',
-      details,
+      res.clearCookie(SESSION_COOKIE_NAME, {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production',
+      });
+
+      res.json({
+        success: true,
+        message: 'Logged out successfully.',
+      });
     });
-  }
-});
+  },
+);
 
-type ResolutionEstimate = {
-  earliestAt: string;
-  latestAt: string;
-  minDays: number;
-  maxDays: number;
-  basis: string;
-  disclaimer: string;
-};
 
-function createResolutionEstimate(
-  severity: string,
-  reportedAt: string,
-): ResolutionEstimate {
-  // Illustrative prototype ranges only; these are not municipal service targets.
-  const ranges: Record<string, { minDays: number; maxDays: number }> = {
-    Critical: { minDays: 1, maxDays: 3 },
-    High: { minDays: 3, maxDays: 7 },
-    Medium: { minDays: 7, maxDays: 14 },
-    Low: { minDays: 14, maxDays: 30 },
-  };
+/* ----------------------------- AI Analysis ----------------------------- */
 
-  const range = ranges[severity] ?? ranges.Medium;
-  const reportedDate = new Date(reportedAt);
-  const earliest = new Date(reportedDate);
-  earliest.setUTCDate(earliest.getUTCDate() + range.minDays);
-  const latest = new Date(reportedDate);
-  latest.setUTCDate(latest.getUTCDate() + range.maxDays);
+app.post(
+  '/api/ai/analyze-issue',
+  requireRoles('citizen'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      if (!GEMINI_API_KEY) {
+        res.status(503).json({
+          success: false,
+          message: 'AI analysis is not configured on this server.',
+        });
+        return;
+      }
 
-  return {
-    earliestAt: earliest.toISOString(),
-    latestAt: latest.toISOString(),
-    minDays: range.minDays,
-    maxDays: range.maxDays,
-    basis: `Illustrative planning range based on the citizen-selected ${severity.toLowerCase()} severity.`,
-    disclaimer:
-      'This is an estimate for demonstration only. It is not based on municipal service-level data, does not confirm authority acceptance, and is not a guaranteed repair deadline.',
-  };
+      const { image: imageValue, description } = req.body ?? {};
+
+      // Description is optional: AI can analyze the image by itself.
+      if (
+        (description !== undefined &&
+          description !== null &&
+          typeof description !== 'string') ||
+        (typeof description === 'string' &&
+          description.trim().length > 3000)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'The description must be 3,000 characters or fewer.',
+        });
+        return;
+      }
+
+      const userDescription =
+        typeof description === 'string' ? description.trim() : '';
+
+      const imageData = parseImageData(imageValue);
+
+      if (!imageData) {
+        res.status(400).json({
+          success: false,
+          message:
+            'Upload a valid JPEG, PNG, or WebP image under 8 MB.',
+        });
+        return;
+      }
+
+      const prompt = `
+You assist with preliminary civic infrastructure issue reporting.
+
+${userDescription
+  ? `User-provided description: ${userDescription}`
+  : 'No description was provided. Analyze the attached image and generate a concise description based only on visible details.'}
+
+Analyze the attached image. Return only a valid JSON object with these fields:
+{
+  "category": "Potholes | Streetlights | Drainage | Open Manholes | Water Leaks | Debris & Floods",
+  "severity": "Low | Medium | High | Critical",
+  "title": "short issue title",
+  "summary": "clear description of the visible issue",
+  "suggestedAction": "reasonable suggested next step",
+  "confidence": 0.0
 }
 
-// Health check.
-app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'RoadWatch API',
-  });
-});
+Use the image as the primary evidence. If a user description is supplied,
+use it as additional context, but do not assume unverified details are true.
+Do not invent the location, time, identity of the reporter, or whether
+a repair has occurred. If the image is unclear or the issue cannot be
+identified, explain that in the summary and choose the closest reasonable
+category. Treat all results as suggestions requiring human review.
+`;
 
-// Register public accounts as citizens only.
-app.post('/api/auth/register', async (req, res) => {
-  if (!usersCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
-
-  try {
-    const { name, email, password, ward, phone } = req.body ?? {};
-
-    if (
-      !validText(name, 100) ||
-      !validText(email, 254) ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
-      typeof password !== 'string' ||
-      password.length < 8 ||
-      password.length > 72 ||
-      (ward !== undefined && !validText(ward, 100)) ||
-      (phone !== undefined &&
-        (typeof phone !== 'string' || phone.length > 30))
-    ) {
-      res.status(400).json({
-        error: 'Enter a valid name, email, password (8–72 characters), and optional contact details.',
-      });
-      return;
-    }
-
-    const normalizedEmail = email.trim().toLowerCase();
-
-    const existingUser = await usersCollection.findOne({
-      email: normalizedEmail,
-    });
-
-    if (existingUser) {
-      res.status(409).json({
-        error: 'An account with this email already exists.',
-      });
-      return;
-    }
-
-    const user: UserDocument = {
-      id: randomUUID(),
-      name: name.trim(),
-      email: normalizedEmail,
-      passwordHash: await bcrypt.hash(password, 12),
-      role: 'citizen',
-      ward: typeof ward === 'string' ? ward.trim() : undefined,
-      phone: typeof phone === 'string' ? phone.trim() : undefined,
-      createdAt: new Date().toISOString(),
-    };
-
-    await usersCollection.insertOne(user);
-
-    await new Promise<void>((resolve, reject) => {
-      req.session.regenerate((error) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
-
-    req.session.userId = user.id;
-
-    await new Promise<void>((resolve, reject) => {
-      req.session.save((error) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
-
-    res.status(201).json({ user: publicUser(user) });
-  } catch (error) {
-    if (
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      error.code === 11000
-    ) {
-      res.status(409).json({
-        error: 'An account with this email already exists.',
-      });
-      return;
-    }
-
-    console.error('Registration failed:', error);
-    res.status(500).json({ error: 'Could not create your account.' });
-  }
-});
-
-// Sign in using the stored password hash.
-app.post('/api/auth/login', async (req, res) => {
-  if (!usersCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
-
-  try {
-    const { email, password } = req.body ?? {};
-
-    if (
-      typeof email !== 'string' ||
-      typeof password !== 'string' ||
-      email.length > 254 ||
-      password.length > 72
-    ) {
-      res.status(400).json({ error: 'Enter your email and password.' });
-      return;
-    }
-
-    const user = await usersCollection.findOne({
-      email: email.trim().toLowerCase(),
-    });
-
-    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
-      res.status(401).json({ error: 'Invalid email or password.' });
-      return;
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      req.session.regenerate((error) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
-
-    req.session.userId = user.id;
-
-    await new Promise<void>((resolve, reject) => {
-      req.session.save((error) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
-
-    res.json({ user: publicUser(user) });
-  } catch (error) {
-    console.error('Login failed:', error);
-    res.status(500).json({ error: 'Could not sign in.' });
-  }
-});
-
-// Return the server-verified identity for the current session.
-app.get('/api/auth/me', requireAuth, async (req, res) => {
-  if (!usersCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
-
-  try {
-    const user = await usersCollection.findOne({
-      id: req.session.userId,
-    });
-
-    if (!user) {
-      req.session.destroy(() => {});
-      res.clearCookie(SESSION_COOKIE);
-      res.status(401).json({ error: 'Your session is no longer valid.' });
-      return;
-    }
-
-    res.json({ user: publicUser(user) });
-  } catch (error) {
-    console.error('Session lookup failed:', error);
-    res.status(500).json({ error: 'Could not verify your session.' });
-  }
-});
-
-// Sign out and invalidate the server-side session.
-app.post('/api/auth/logout', (req, res) => {
-  req.session.destroy((error) => {
-    if (error) {
-      res.status(500).json({ error: 'Could not sign out.' });
-      return;
-    }
-
-    res.clearCookie(SESSION_COOKIE, {
-      httpOnly: true,
-      secure: IS_PRODUCTION,
-      sameSite: 'lax',
-      path: '/',
-    });
-
-    res.json({ message: 'Signed out successfully.' });
-  });
-});
-
-// Fetch complaints. Demo complaints should be labelled by the frontend.
-app.get('/api/complaints', async (req, res) => {
-  if (!complaintsCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
-
-  try {
-    const filter: Document = {};
-
-    if (typeof req.query.category === 'string') {
-      filter.category = req.query.category;
-    }
-
-    if (typeof req.query.status === 'string') {
-      filter.status = req.query.status;
-    }
-
-    if (typeof req.query.ward === 'string') {
-      filter.ward = req.query.ward;
-    }
-
-    if (typeof req.query.search === 'string' && req.query.search.trim()) {
-      const search = req.query.search.trim().slice(0, 100);
-      const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-      filter.$or = [
-        { id: { $regex: escapedSearch, $options: 'i' } },
-        { title: { $regex: escapedSearch, $options: 'i' } },
-        { description: { $regex: escapedSearch, $options: 'i' } },
-        { locationName: { $regex: escapedSearch, $options: 'i' } },
+      const modelsToTry = [
+        'gemini-3.8-flash',
+        'gemini-3.7-flash',
+        'gemini-3.6-flash',
+        'gemini-3.5-flash',
+        'gemini-3.5-flash-lite',
+        'gemini-2.5-flash-lite',
       ];
-    }
 
-    const complaints = await complaintsCollection
-      .find(filter)
-      .sort({ reportedAt: -1 })
-      .limit(500)
-      .toArray();
+      let text = '';
 
-    res.json(complaints);
-  } catch (error) {
-    console.error('Failed to fetch complaints:', error);
-    res.status(500).json({ error: 'Could not fetch complaints.' });
-  }
-});
+      for (const model of modelsToTry) {
+        try {
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=` +
+              encodeURIComponent(GEMINI_API_KEY),
+            {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                contents: [
+                  {
+                    parts: [
+                      { text: prompt },
+                      {
+                        inline_data: {
+                          mime_type: imageData.mimeType,
+                          data: imageData.base64,
+                        },
+                      },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.2,
+                  responseMimeType: 'application/json',
+                },
+              }),
+            },
+          );
 
-// Fetch a complaint by its tracking ID.
-app.get('/api/complaints/:id', async (req, res) => {
-  if (!complaintsCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
+          if (response.ok) {
+            const result = (await response.json()) as any;
+            text =
+              result?.candidates?.[0]?.content?.parts
+                ?.map((part: any) => part.text ?? '')
+                .join('') || '';
 
-  try {
-    const complaint = await complaintsCollection.findOne({
-      id: req.params.id,
-    });
+            if (text) break;
+          }
+        } catch {
+          // Continue to next model on network/timeout error
+        }
+      }
 
-    if (!complaint) {
-      res.status(404).json({ error: 'Complaint not found.' });
-      return;
-    }
+      if (!text) {
+        res.status(502).json({
+          success: false,
+          message:
+            'AI analysis is temporarily unavailable. Please proceed by entering issue details manually.',
+        });
+        return;
+      }
 
-    res.json(complaint);
-  } catch (error) {
-    console.error('Failed to fetch complaint:', error);
-    res.status(500).json({ error: 'Could not fetch complaint.' });
-  }
-});
+      let analysis: Record<string, unknown>;
 
-// Only signed-in citizens can submit new complaints.
-app.post('/api/complaints', requireAuth, async (req, res) => {
-  if (!complaintsCollection || !usersCollection) {
-    res.status(503).json({ error: 'Database is not ready.' });
-    return;
-  }
+      try {
+        analysis = JSON.parse(text);
+      } catch {
+        console.error('Gemini returned invalid JSON:', text);
 
-  try {
-    const body = req.body as Partial<Complaint>;
+        res.status(502).json({
+          success: false,
+          message: 'The AI returned an invalid analysis format.',
+        });
+        return;
+      }
 
-    const user = await usersCollection.findOne({
-      id: req.session.userId,
-    });
-
-    if (!user) {
-      res.status(401).json({ error: 'Please sign in again.' });
-      return;
-    }
-
-    if (user.role !== 'citizen') {
-      res.status(403).json({
-        error: 'Only citizen accounts can submit citizen reports.',
+      res.json({
+        success: true,
+        analysis,
+        disclaimer:
+          'AI suggestions may be incorrect and must be reviewed by a person.',
       });
-      return;
+    } catch (error) {
+      console.error('AI analysis error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to analyze this issue.',
+      });
     }
+  },
+);
 
-    const requiredTextFields = [
-      body.title,
-      body.description,
-      body.ward,
-      body.locationName,
-    ];
+/* --------------------------- Complaint Read --------------------------- */
 
-    if (
-      requiredTextFields.some(
-        (value) => typeof value !== 'string' || !value.trim(),
-      ) ||
-      ![
+app.get(
+  '/api/complaints',
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const complaints = getComplaintsCollection();
+
+      const records = await complaints
+        .find({})
+        .sort({ reportedAt: -1 })
+        .toArray();
+
+      res.json({
+        success: true,
+        complaints: records.map((record: any) =>
+          cleanComplaint(record),
+        ),
+      });
+    } catch (error) {
+      console.error('Get complaints error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to load complaints.',
+      });
+    }
+  },
+);
+
+app.get(
+  '/api/complaints/:id',
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const complaints = getComplaintsCollection();
+
+      const complaint = await complaints.findOne({
+        id: req.params.id,
+      });
+
+      if (!complaint) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        complaint: cleanComplaint(complaint),
+      });
+    } catch (error) {
+      console.error('Get complaint error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to load the complaint.',
+      });
+    }
+  },
+);
+
+/* -------------------------- Complaint Creation -------------------------- */
+
+app.post(
+  '/api/complaints',
+  requireRoles('citizen'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const {
+        title,
+        category,
+        description,
+        severity,
+        ward,
+        locationName,
+        coordinates,
+        citizenPhoneMasked,
+        evidence,
+        jurisdictionSuggestion,
+      } = req.body ?? {};
+
+      const allowedCategories = [
         'Potholes',
         'Streetlights',
         'Drainage',
         'Open Manholes',
         'Water Leaks',
         'Debris & Floods',
-      ].includes(body.category ?? '') ||
-      !['Low', 'Medium', 'High', 'Critical'].includes(body.severity ?? '') ||
-      !body.coordinates ||
-      typeof body.coordinates.lat !== 'number' ||
-      typeof body.coordinates.lng !== 'number' ||
-      !Number.isFinite(body.coordinates.lat) ||
-      !Number.isFinite(body.coordinates.lng) ||
-      body.coordinates.lat < -90 ||
-      body.coordinates.lat > 90 ||
-      body.coordinates.lng < -180 ||
-      body.coordinates.lng > 180 ||
-      !body.evidence ||
-      typeof body.evidence !== 'object'
-    ) {
-      res.status(400).json({
-        error: 'Please provide valid complaint details, coordinates, and evidence information.',
+      ];
+
+      const allowedSeverities = [
+        'Low',
+        'Medium',
+        'High',
+        'Critical',
+      ];
+
+      if (
+        !isValidString(title, 150) ||
+        !isValidString(description, 3000) ||
+        !allowedCategories.includes(category) ||
+        !allowedSeverities.includes(severity) ||
+        !isValidString(ward, 100) ||
+        !isValidString(locationName, 300)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Complete all required complaint fields correctly.',
+        });
+        return;
+      }
+
+      const lat = Number(coordinates?.lat);
+      const lng = Number(coordinates?.lng);
+
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lng) ||
+        lat < -90 ||
+        lat > 90 ||
+        lng < -180 ||
+        lng > 180
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Provide valid complaint coordinates.',
+        });
+        return;
+      }
+
+      const complaints = getComplaintsCollection();
+      const now = new Date().toISOString();
+      const user = req.session.user!;
+
+      let generatedId = createComplaintId();
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const existing = await complaints.findOne({ id: generatedId });
+        if (!existing) break;
+        generatedId = createComplaintId();
+      }
+
+      const complaint: ComplaintDocument = {
+        id: generatedId,
+        title: title.trim(),
+        category,
+        description: description.trim(),
+        severity,
+        status: 'Submitted',
+        ward: ward.trim(),
+        locationName: locationName.trim(),
+        coordinates: { lat, lng },
+        reportedAt: now,
+        updatedAt: now,
+        citizenName: user.name,
+        ...(isValidString(citizenPhoneMasked, 30)
+          ? { citizenPhoneMasked: citizenPhoneMasked.trim() }
+          : {}),
+        evidence: evidence && typeof evidence === 'object' ? evidence : {
+          beforePhotoUrl: '',
+          beforeTimestamp: now,
+          beforeCoordinates: {
+            lat,
+            lng,
+            address: locationName.trim(),
+          },
+        },
+        ...(jurisdictionSuggestion ? { jurisdictionSuggestion } : {}),
+        reportedByUserId: user.id,
+        isDemoData: false,
+        endorsementsCount: 0,
+        commentsCount: 0,
+        comments: [],
+      };
+
+      await complaints.insertOne(complaint);
+
+      res.status(201).json({
+        success: true,
+        id: complaint.id,
+        complaint: cleanComplaint(complaint),
+        message: 'Complaint submitted successfully.',
       });
-      return;
+    } catch (error) {
+      console.error('Create complaint error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to submit the complaint.',
+      });
     }
+  },
+);
 
-    let id = '';
+/* ----------------------------- Status Update ----------------------------- */
 
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const candidate = `RW-${new Date().getFullYear()}-${randomInt(1000, 10000)}`;
-      const existing = await complaintsCollection.findOne({ id: candidate });
+app.patch(
+  '/api/complaints/:id/status',
+  requireRoles('authority', 'admin', 'field_crew'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { status, note } = req.body ?? {};
+      const user = req.session.user!;
+
+      // Field crew can only mark tasks as In Progress
+      if (user.role === 'field_crew' && status !== 'In Progress') {
+        res.status(403).json({
+          success: false,
+          message: 'Field crew can only update status to In Progress.',
+        });
+        return;
+      }
+
+      const allowedStatuses: ComplaintStatus[] = [
+        'Submitted',
+        'Under Review',
+        'Assigned',
+        'In Progress',
+        'Evidence Submitted',
+        'Authority Review',
+        'Resolved',
+        'Reopened',
+        'Flagged for Audit',
+      ];
+
+      if (!allowedStatuses.includes(status)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid complaint status.',
+        });
+        return;
+      }
+
+      if (note !== undefined && !isValidString(note, 1000)) {
+        res.status(400).json({
+          success: false,
+          message: 'The status note is invalid.',
+        });
+        return;
+      }
+
+      const complaints = getComplaintsCollection();
+
+      const update: Record<string, any> = {
+        $set: {
+          status,
+          updatedAt: new Date().toISOString(),
+        },
+      };
+
+      const auditNote = note?.trim() || `Status updated to "${status}" by ${user.name} (${user.role}).`;
+      update.$push = {
+        comments: makeComment(user.name, user.role, auditNote),
+      };
+      update.$inc = { commentsCount: 1 };
+
+      const result = await complaints.updateOne(
+        { id: req.params.id },
+        update,
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: `Complaint status updated to ${status}.`,
+      });
+    } catch (error) {
+      console.error('Status update error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to update complaint status.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Crew Assignment ----------------------------- */
+
+app.patch(
+  '/api/complaints/:id/crew',
+  requireRoles('authority', 'admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { assignedCrew, note } = req.body ?? {};
+
+      let crewObj: Record<string, any>;
+      let crewDisplayName: string;
+
+      if (
+        typeof assignedCrew === 'object' &&
+        assignedCrew !== null &&
+        typeof assignedCrew.name === 'string' &&
+        assignedCrew.name.trim().length > 0
+      ) {
+        crewDisplayName = assignedCrew.name.trim();
+        crewObj = {
+          id: assignedCrew.id || `crew-${createId('CRW')}`,
+          name: crewDisplayName,
+          leadForeman: assignedCrew.leadForeman || 'Lead Foreman',
+          phone: assignedCrew.phone || '+91 94481 02931',
+          membersCount: Number(assignedCrew.membersCount) || 4,
+        };
+      } else if (isValidString(assignedCrew, 150)) {
+        crewDisplayName = assignedCrew.trim();
+        crewObj = {
+          id: `crew-${createId('CRW')}`,
+          name: crewDisplayName,
+          leadForeman: 'Lead Foreman',
+          phone: '+91 94481 02931',
+          membersCount: 4,
+        };
+      } else {
+        res.status(400).json({
+          success: false,
+          message: 'Provide valid crew assignment information.',
+        });
+        return;
+      }
+
+      if (note !== undefined && !isValidString(note, 1000)) {
+        res.status(400).json({
+          success: false,
+          message: 'The assignment note is invalid.',
+        });
+        return;
+      }
+
+      const complaints = getComplaintsCollection();
+      const user = req.session.user!;
+
+      const update: Record<string, any> = {
+        $set: {
+          assignedCrew: crewObj,
+          status: 'Assigned',
+          updatedAt: new Date().toISOString(),
+        },
+        $push: {
+          comments: makeComment(
+            user.name,
+            user.role,
+            note?.trim() || `Assigned to ${crewDisplayName}.`,
+          ),
+        },
+        $inc: { commentsCount: 1 },
+      };
+
+      const result = await complaints.updateOne(
+        { id: req.params.id },
+        update,
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: 'Crew assigned successfully.',
+      });
+    } catch (error) {
+      console.error('Crew assignment error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to assign the crew.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Repair Evidence ----------------------------- */
+
+app.patch(
+  '/api/complaints/:id/evidence',
+  requireRoles('field_crew', 'authority', 'admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { evidence, note } = req.body ?? {};
+
+      if (
+        !evidence ||
+        typeof evidence !== 'object' ||
+        Array.isArray(evidence)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Provide valid repair evidence.',
+        });
+        return;
+      }
+
+      if (note !== undefined && !isValidString(note, 1000)) {
+        res.status(400).json({
+          success: false,
+          message: 'The evidence note is invalid.',
+        });
+        return;
+      }
+
+      const complaints = getComplaintsCollection();
+      const user = req.session.user!;
+      const existing = await complaints.findOne({ id: req.params.id });
 
       if (!existing) {
-        id = candidate;
-        break;
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
       }
-    }
 
-    if (!id) {
-      res.status(503).json({
-        error: 'Could not generate a tracking ID. Please try again.',
+      const mergedEvidence = {
+        ...(existing.evidence || {}),
+        ...evidence,
+        afterTimestamp: evidence.afterTimestamp || new Date().toISOString(),
+      };
+
+      const update: Record<string, any> = {
+        $set: {
+          evidence: mergedEvidence,
+          status: 'Evidence Submitted',
+          updatedAt: new Date().toISOString(),
+          ...(note ? { workNotes: note.trim() } : {}),
+        },
+        $push: {
+          comments: makeComment(
+            user.name,
+            user.role,
+            note?.trim() || 'Repair evidence submitted for authority review.',
+          ),
+        },
+        $inc: { commentsCount: 1 },
+      };
+
+      await complaints.updateOne(
+        { id: req.params.id },
+        update,
+      );
+
+      res.json({
+        success: true,
+        message: 'Evidence submitted for authority review.',
       });
+    } catch (error) {
+      console.error('Evidence submission error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to submit repair evidence.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Evidence Review ----------------------------- */
+
+app.patch(
+  '/api/complaints/:id/evidence-review',
+  requireRoles('authority', 'admin'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { decision, note } = req.body ?? {};
+
+      const statusByDecision: Record<string, ComplaintStatus> = {
+        approve: 'Resolved',
+        flag: 'Flagged for Audit',
+        reject: 'Reopened',
+      };
+
+      const nextStatus = statusByDecision[decision];
+
+      if (!nextStatus) {
+        res.status(400).json({
+          success: false,
+          message: 'Decision must be approve, flag, or reject.',
+        });
+        return;
+      }
+
+      if (note !== undefined && !isValidString(note, 1000)) {
+        res.status(400).json({
+          success: false,
+          message: 'The review note is invalid.',
+        });
+        return;
+      }
+
+      const complaints = getComplaintsCollection();
+      const user = req.session.user!;
+
+      const defaultNote: Record<string, string> = {
+        approve: 'Authority approved the submitted repair evidence.',
+        flag: 'Evidence flagged for further audit.',
+        reject: 'Evidence rejected; further repair is required.',
+      };
+
+      const result = await complaints.updateOne(
+        { id: req.params.id },
+        {
+          $set: {
+            status: nextStatus,
+            updatedAt: new Date().toISOString(),
+          },
+          $push: {
+            comments: makeComment(
+              user.name,
+              user.role,
+              note?.trim() || defaultNote[decision],
+            ),
+          },
+          $inc: { commentsCount: 1 },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        status: nextStatus,
+        message: 'Evidence review completed.',
+      });
+    } catch (error) {
+      console.error('Evidence review error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to review repair evidence.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Citizen Feedback ----------------------------- */
+
+app.post(
+  '/api/complaints/:id/feedback',
+  requireRoles('citizen'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const {
+        resolutionStatus,
+        rating,
+        durability,
+        turnaroundSla,
+        smsClarity,
+        followUpPhotoUrl,
+        testimonialText,
+        publishPublicly,
+        nominateCrew,
+      } = req.body ?? {};
+
+      const validResolutionStatuses = [
+        'fully_repaired',
+        'partially_repaired',
+        'not_repaired',
+      ];
+
+      const validDurability = [
+        'Needs Rework',
+        'Passable',
+        'High Standard',
+        'Flawless Grade',
+      ];
+
+      const validTurnaround = [
+        'Behind Schedule',
+        'On-Time (Target Met)',
+        'Ahead of Schedule (<30h)',
+      ];
+
+      const validSmsClarity = [
+        'Unclear / Delayed SMS',
+        'Clear & Informative',
+        'Proactive Updates',
+      ];
+
+      if (
+        !validResolutionStatuses.includes(resolutionStatus) ||
+        !Number.isInteger(rating) ||
+        rating < 1 ||
+        rating > 5 ||
+        !validDurability.includes(durability) ||
+        !validTurnaround.includes(turnaroundSla) ||
+        !validSmsClarity.includes(smsClarity)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'Please provide valid feedback values.',
+        });
+        return;
+      }
+
+      if (
+        testimonialText !== undefined &&
+        testimonialText !== '' &&
+        !isValidString(testimonialText, 2000)
+      ) {
+        res.status(400).json({
+          success: false,
+          message: 'The testimonial is invalid.',
+        });
+        return;
+      }
+
+      const feedback = {
+        resolutionStatus,
+        rating,
+        durability,
+        turnaroundSla,
+        smsClarity,
+        ...(typeof followUpPhotoUrl === 'string'
+          ? { followUpPhotoUrl }
+          : {}),
+        testimonialText:
+          typeof testimonialText === 'string'
+            ? testimonialText.trim()
+            : '',
+        publishPublicly: publishPublicly === true,
+        nominateCrew: nominateCrew === true,
+        submittedAt: new Date().toISOString(),
+        submittedBy: req.session.user!.id,
+      };
+
+      const complaints = getComplaintsCollection();
+      const user = req.session.user!;
+
+      const result = await complaints.updateOne(
+        { id: req.params.id },
+        {
+          $set: {
+            feedback,
+            updatedAt: new Date().toISOString(),
+          },
+          $push: {
+            comments: makeComment(
+              user.name,
+              user.role,
+              'Citizen feedback submitted.',
+            ),
+          },
+          $inc: { commentsCount: 1 },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        feedback,
+        message: 'Feedback submitted successfully.',
+      });
+    } catch (error) {
+      console.error('Citizen feedback error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to submit feedback.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Endorsement ----------------------------- */
+
+app.post(
+  '/api/complaints/:id/endorse',
+  requireRoles('citizen'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const complaints = getComplaintsCollection();
+
+      const result = await complaints.updateOne(
+        { id: req.params.id },
+        {
+          $inc: { endorsementsCount: 1 },
+          $set: { updatedAt: new Date().toISOString() },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: 'Complaint endorsed successfully.',
+      });
+    } catch (error) {
+      console.error('Endorsement error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to endorse this complaint.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Comments ----------------------------- */
+
+app.post(
+  '/api/complaints/:id/comments',
+  requireAuthentication,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { text } = req.body ?? {};
+
+      if (!isValidString(text, 2000)) {
+        res.status(400).json({
+          success: false,
+          message: 'Enter a comment of up to 2,000 characters.',
+        });
+        return;
+      }
+
+      const complaints = getComplaintsCollection();
+      const user = req.session.user!;
+
+      const comment = makeComment(
+        user.name,
+        user.role,
+        text.trim(),
+      );
+
+      const result = await complaints.updateOne(
+        { id: req.params.id },
+        {
+          $push: { comments: comment },
+          $inc: { commentsCount: 1 },
+          $set: { updatedAt: new Date().toISOString() },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        res.status(404).json({
+          success: false,
+          message: 'Complaint not found.',
+        });
+        return;
+      }
+
+      res.status(201).json({
+        success: true,
+        comment,
+        message: 'Comment added successfully.',
+      });
+    } catch (error) {
+      console.error('Add comment error:', error);
+
+      res.status(500).json({
+        success: false,
+        message: 'Unable to add the comment.',
+      });
+    }
+  },
+);
+
+/* ----------------------------- Not Found ----------------------------- */
+
+app.use(
+  (req: Request, res: Response): void => {
+    res.status(404).json({
+      success: false,
+      message: `API route not found: ${req.method} ${req.path}`,
+    });
+  },
+);
+
+/* ----------------------------- Error Handler ----------------------------- */
+
+app.use(
+  (
+    error: Error,
+    _req: Request,
+    res: Response,
+    _next: NextFunction,
+  ): void => {
+    console.error('Unhandled server error:', error);
+
+    if (res.headersSent) {
       return;
     }
 
-    const now = new Date().toISOString();
-    const resolutionEstimate = createResolutionEstimate(body.severity!, now);
-
-    const newComplaint = {
-      id,
-      title: body.title!.trim(),
-      category: body.category!,
-      description: body.description!.trim(),
-      severity: body.severity!,
-      status: 'Submitted',
-      ward: body.ward!.trim(),
-      locationName: body.locationName!.trim(),
-      coordinates: {
-        lat: body.coordinates.lat,
-        lng: body.coordinates.lng,
-      },
-      reportedAt: now,
-      updatedAt: now,
-      resolutionEstimate,
-      citizenName: user.name,
-      citizenPhoneMasked: undefined,
-      evidence: body.evidence,
-      endorsementsCount: 0,
-      commentsCount: 0,
-      comments: [],
-      isDemoData: false,
-      reportedByUserId: user.id,
-    };
-
-    await complaintsCollection.insertOne(newComplaint);
-
-    res.status(201).json(newComplaint);
-  } catch (error) {
-    console.error('Failed to create complaint:', error);
-    res.status(500).json({ error: 'Could not save the complaint.' });
-  }
-});
-
-async function startServer() {
-  if (!MONGODB_URI) {
-    console.error('MONGODB_URI is missing from the root .env file.');
-    process.exitCode = 1;
-    return;
-  }
-
-  if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
-    console.error(
-      'SESSION_SECRET is missing or too short. Configure a strong secret in the root .env file.',
-    );
-    process.exitCode = 1;
-    return;
-  }
-
-  let client: MongoClient | undefined;
-
-  try {
-    client = new MongoClient(MONGODB_URI);
-    await client.connect();
-
-    const database = client.db('roadwatch');
-    await database.command({ ping: 1 });
-
-    usersCollection = database.collection<UserDocument>('users');
-    complaintsCollection = database.collection('complaints');
-
-    await usersCollection.createIndex({ email: 1 }, { unique: true });
-    await usersCollection.createIndex({ id: 1 }, { unique: true });
-    await complaintsCollection.createIndex({ id: 1 }, { unique: true });
-
-    const store = MongoStore.create({
-      client,
-      dbName: 'roadwatch',
-      collectionName: 'sessions',
-      ttl: 14 * 24 * 60 * 60,
-      autoRemove: 'native',
+    res.status(500).json({
+      success: false,
+      message: 'An unexpected server error occurred.',
     });
+  },
+);
 
-    sessionMiddleware = session({
-      name: SESSION_COOKIE,
-      secret: SESSION_SECRET,
-      store,
-      resave: false,
-      saveUninitialized: false,
-      cookie: {
-        httpOnly: true,
-        secure: IS_PRODUCTION,
-        sameSite: 'lax',
-        maxAge: 14 * 24 * 60 * 60 * 1000,
-        path: '/',
-      },
-    });
+/* ----------------------------- Server Startup ----------------------------- */
 
-    console.log('MongoDB connected successfully.');
-    console.log('Authentication and session store initialized.');
-    console.log(
-      GEMINI_API_KEY
-        ? 'Gemini API key detected.'
-        : 'Warning: GEMINI_API_KEY is missing; AI analysis will be unavailable.',
-    );
+async function seedDemoData(): Promise<void> {
+  const users = getUsersCollection();
+  const complaints = getComplaintsCollection();
+  const now = new Date().toISOString();
+  const defaultPasswordHash = await bcrypt.hash('RoadWatch2025!', 10);
 
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`RoadWatch API running on port ${PORT}.`);
-    });
-  } catch (error) {
-    console.error('RoadWatch startup failed.');
-
-    if (error instanceof Error) {
-      console.error(`${error.name}: ${error.message}`);
-    } else {
-      console.error('An unknown error occurred.');
+  for (const demoUser of DEMO_USERS) {
+    const existing = await users.findOne({ email: demoUser.email.toLowerCase() });
+    if (!existing) {
+      await users.insertOne({
+        id: demoUser.id,
+        name: demoUser.name,
+        email: demoUser.email.toLowerCase(),
+        passwordHash: defaultPasswordHash,
+        role: demoUser.role,
+        ward: demoUser.ward,
+        department: demoUser.department,
+        phone: demoUser.phone,
+        createdAt: now,
+        updatedAt: now,
+      });
+      console.log(`Seeded demonstration account: ${demoUser.name} (${demoUser.email} / ${demoUser.role})`);
     }
+  }
 
-    if (client) {
-      await client.close().catch(() => {});
+  for (const sample of INITIAL_COMPLAINTS) {
+    const existing = await complaints.findOne({ id: sample.id });
+    if (!existing) {
+      await complaints.insertOne({
+        ...sample,
+        reportedAt: sample.reportedAt || now,
+        updatedAt: sample.updatedAt || now,
+        isDemoData: true,
+      });
+      console.log(`Seeded demonstration complaint: ${sample.id} (${sample.title})`);
     }
-
-    process.exitCode = 1;
   }
 }
 
-startServer();
+async function startServer(): Promise<void> {
+  if (!MONGODB_URI) {
+    throw new Error(
+      'MONGODB_URI is missing from your server environment.',
+    );
+  }
+
+  if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
+    throw new Error(
+      'SESSION_SECRET must be set to a value of at least 32 characters.',
+    );
+  }
+
+  mongoClient = new MongoClient(MONGODB_URI, {
+    serverSelectionTimeoutMS: 10000,
+  });
+
+  await mongoClient.connect();
+
+  database = mongoClient.db(DATABASE_NAME);
+
+  await database.command({ ping: 1 });
+
+  usersCollection = database.collection(
+    'users',
+  ) as unknown as UserCollection;
+
+  complaintsCollection = database.collection(
+    'complaints',
+  ) as unknown as ComplaintCollection;
+
+  await getUsersCollection().createIndex(
+    { email: 1 },
+    { unique: true },
+  );
+
+  await getComplaintsCollection().createIndex(
+    { id: 1 },
+    { unique: true },
+  );
+
+  sessionMiddleware = session({
+    name: SESSION_COOKIE_NAME,
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    rolling: true,
+    store: MongoStore.create({
+      client: mongoClient,
+      dbName: DATABASE_NAME,
+      collectionName: 'sessions',
+      ttl: 60 * 60 * 24 * 7,
+    }),
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 1000 * 60 * 60 * 24 * 7,
+    },
+  });
+
+  await seedDemoData();
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`RoadWatch API running on port ${PORT}`);
+    console.log('MongoDB connected successfully.');
+    console.log('Health check: /api/health');
+  });
+}
+
+startServer().catch((error: unknown) => {
+  console.error('Failed to start RoadWatch API:', getErrorMessage(error));
+  process.exitCode = 1;
+});

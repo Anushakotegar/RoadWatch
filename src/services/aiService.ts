@@ -1,4 +1,3 @@
-
 import type {
   ComplaintCategory,
   SeverityLevel,
@@ -16,10 +15,62 @@ export interface IssueAnalysis {
 }
 
 interface AnalysisResponse {
-  analysis?: IssueAnalysis;
+  success?: boolean;
+  analysis?: {
+    category?: string;
+    severity?: string;
+    title?: string;
+    summary?: string;
+    suggestedAction?: string;
+    confidence?: number;
+    suggestedCategory?: string;
+    suggestedSeverity?: string;
+    observations?: string[];
+    suggestedDescription?: string;
+    recommendedAction?: string;
+    limitations?: string;
+  };
   error?: string;
   message?: string;
-  requiresHumanReview?: boolean;
+  disclaimer?: string;
+}
+
+const ALLOWED_CATEGORIES = [
+  'Potholes',
+  'Streetlights',
+  'Drainage',
+  'Open Manholes',
+  'Water Leaks',
+  'Debris & Floods',
+] as const;
+
+const ALLOWED_SEVERITIES = [
+  'Low',
+  'Medium',
+  'High',
+  'Critical',
+] as const;
+
+function normalizeCategory(value?: string): ComplaintCategory {
+  if (
+    value &&
+    ALLOWED_CATEGORIES.includes(value as (typeof ALLOWED_CATEGORIES)[number])
+  ) {
+    return value as ComplaintCategory;
+  }
+
+  return 'Drainage' as ComplaintCategory;
+}
+
+function normalizeSeverity(value?: string): SeverityLevel {
+  if (
+    value &&
+    ALLOWED_SEVERITIES.includes(value as (typeof ALLOWED_SEVERITIES)[number])
+  ) {
+    return value as SeverityLevel;
+  }
+
+  return 'Medium' as SeverityLevel;
 }
 
 export const aiService = {
@@ -74,9 +125,8 @@ export const aiService = {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            imageBase64,
-            mimeType: image.type,
-            reportDescription: reportDescription.trim(),
+            image: imageBase64,
+            description: reportDescription.trim(),
           }),
         },
       );
@@ -90,7 +140,9 @@ export const aiService = {
 
     if (!response.ok) {
       throw new Error(
-        data.error || 'Image analysis failed. Please try again.',
+        data.message ||
+          data.error ||
+          'Image analysis failed. Please try again.',
       );
     }
 
@@ -98,6 +150,30 @@ export const aiService = {
       throw new Error('The AI did not return an analysis.');
     }
 
-    return data.analysis;
+    const analysis = data.analysis;
+
+    return {
+      suggestedCategory: normalizeCategory(
+        analysis.suggestedCategory ?? analysis.category,
+      ),
+      suggestedSeverity: normalizeSeverity(
+        analysis.suggestedSeverity ?? analysis.severity,
+      ),
+      observations: analysis.observations ??
+        (analysis.summary ? [analysis.summary] : []),
+      suggestedDescription:
+        analysis.suggestedDescription ??
+        analysis.summary ??
+        analysis.title ??
+        reportDescription.trim(),
+      recommendedAction:
+        analysis.recommendedAction ??
+        analysis.suggestedAction ??
+        'Ask the municipal authority to inspect this issue.',
+      limitations:
+        analysis.limitations ??
+        data.disclaimer ??
+        'AI suggestions may be incorrect and require human review.',
+    };
   },
 };

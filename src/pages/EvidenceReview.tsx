@@ -1,19 +1,17 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { complaintService } from '../services/complaintService';
-import { 
-  ShieldCheck, 
-  CheckCircle2, 
-  AlertCircle, 
-  Clock, 
-  MapPin, 
-  FileCheck, 
-  AlertTriangle, 
-  Lock, 
+import {
+  ShieldCheck,
+  Clock,
+  FileCheck,
+  Lock,
   ArrowLeft,
   Check,
   X,
-  Flag
+  Flag,
+  Image as ImageIcon,
+  AlertTriangle,
 } from 'lucide-react';
 
 interface EvidenceReviewProps {
@@ -22,362 +20,546 @@ interface EvidenceReviewProps {
   onSuccess: () => void;
 }
 
+const IMAGE_PATHS = {
+  potholeBefore:
+    '/src/assets/images/pothole_hazard_indiranagar_1792346312091.jpg',
+  roadAfter:
+    '/src/assets/images/road_repair_completed_bitumen_1792346312012.jpg',
+  manholeBefore:
+    '/src/assets/images/open_manhole_hazard_1792346312725.jpg',
+  crewAfter:
+    '/src/assets/images/municipal_crew_working_1792346313563.jpg',
+};
+
+function getCategoryImages(category: string) {
+  const value = category.toLowerCase();
+
+  if (value.includes('pothole') || value.includes('road')) {
+    return {
+      before: IMAGE_PATHS.potholeBefore,
+      after: IMAGE_PATHS.roadAfter,
+      demo: false,
+    };
+  }
+
+  if (value.includes('manhole')) {
+    return {
+      before: IMAGE_PATHS.manholeBefore,
+      after: IMAGE_PATHS.crewAfter,
+      demo: false,
+    };
+  }
+
+  if (value.includes('streetlight') || value.includes('electrical')) {
+    return {
+      before: IMAGE_PATHS.manholeBefore,
+      after: IMAGE_PATHS.crewAfter,
+      demo: true,
+    };
+  }
+
+  if (value.includes('drain') || value.includes('flood')) {
+    return {
+      before: IMAGE_PATHS.manholeBefore,
+      after: IMAGE_PATHS.crewAfter,
+      demo: true,
+    };
+  }
+
+  return {
+    before: IMAGE_PATHS.potholeBefore,
+    after: IMAGE_PATHS.crewAfter,
+    demo: true,
+  };
+}
+
 export const EvidenceReview: React.FC<EvidenceReviewProps> = ({
   complaintId = 'RW-2025-8488',
   onBack,
-  onSuccess
+  onSuccess,
 }) => {
   const { complaints, showToast, refreshComplaints } = useApp();
-  
-  const activeComplaint = complaints.find(c => c.id === complaintId) || complaints[0];
 
-  const [memo, setMemo] = useState<string>(
-    'Asphalt patch compaction verified against curb line. Bitumen joint sealed properly. Repair complete.'
-  );
-  const [curbCheck, setCurbCheck] = useState<boolean>(true);
-  const [barricadeCheck, setBarricadeCheck] = useState<boolean>(true);
-  const [processing, setProcessing] = useState<boolean>(false);
+  const activeComplaint =
+    complaints.find((complaint) => complaint.id === complaintId) ||
+    complaints[0];
 
-  const handleDecision = async (decision: 'approve' | 'flag' | 'reject') => {
+  const [memo, setMemo] = useState('');
+  const [detailsReviewed, setDetailsReviewed] = useState(false);
+  const [repairReviewed, setRepairReviewed] = useState(false);
+  const [processing, setProcessing] = useState(false);
+
+  if (!activeComplaint) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] p-8">
+        <button
+          onClick={onBack}
+          className="flex items-center gap-2 text-sm text-slate-700"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Back to Authority Workspace
+        </button>
+        <p className="mt-6 text-slate-600">
+          No complaint is available for evidence review.
+        </p>
+      </div>
+    );
+  }
+
+  const evidence = activeComplaint.evidence;
+  const images = getCategoryImages(activeComplaint.category);
+
+  const beforeImage = evidence?.beforePhotoUrl || images.before;
+  const afterImage = evidence?.afterPhotoUrl || images.after;
+
+  const handleDecision = async (
+    decision: 'approve' | 'flag' | 'reject'
+  ) => {
+    if (processing) return;
+
+    if (decision === 'approve') {
+      if (!detailsReviewed || !repairReviewed) {
+        showToast(
+          'Review the complaint details and repair evidence before approval.',
+          'error'
+        );
+        return;
+      }
+
+      if (!memo.trim()) {
+        showToast('Enter the inspection findings before approval.', 'error');
+        return;
+      }
+    }
+
     setProcessing(true);
+
     try {
-      await complaintService.reviewEvidence(activeComplaint.id, decision, memo);
+      await complaintService.reviewEvidence(
+        activeComplaint.id,
+        decision,
+        memo.trim()
+      );
+
       await refreshComplaints();
 
       if (decision === 'approve') {
-        showToast(`Resolution approved for #${activeComplaint.id}. Escrow clearance authorized.`, 'success');
+        showToast(
+          `Resolution approved for ${activeComplaint.id}.`,
+          'success'
+        );
       } else if (decision === 'flag') {
-        showToast(`Case #${activeComplaint.id} flagged for secondary forensic field audit.`, 'error');
+        showToast(
+          `Complaint ${activeComplaint.id} flagged for further review.`,
+          'error'
+        );
       } else {
-        showToast(`Case #${activeComplaint.id} rejected and reopened for rework.`, 'error');
+        showToast(
+          `Complaint ${activeComplaint.id} rejected for further work.`,
+          'error'
+        );
       }
 
       onSuccess();
-    } catch (err) {
-      console.error(err);
-      showToast('Error recording evidence review decision', 'error');
+    } catch (error) {
+      console.error('Evidence review failed:', error);
+      showToast('Could not record the evidence review decision.', 'error');
     } finally {
       setProcessing(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] py-8 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-7xl mx-auto space-y-6">
-        
-        {/* Breadcrumb & Header matching Image 5 */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+    <div className="min-h-screen bg-[#F8FAFC] px-4 py-8 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-7xl space-y-6">
+        <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
           <div>
-            <div className="flex items-center gap-2 text-xs text-slate-500 mb-1">
-              <button onClick={onBack} className="hover:text-slate-800 flex items-center gap-1 cursor-pointer">
-                <ArrowLeft className="w-3 h-3" />
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <button
+                onClick={onBack}
+                className="flex items-center gap-1 hover:text-slate-800"
+              >
+                <ArrowLeft className="h-3 w-3" />
                 Authority Workspace
               </button>
               <span>›</span>
-              <span className="font-mono">{activeComplaint.id}</span>
+              <span>{activeComplaint.id}</span>
               <span>›</span>
-              <span className="font-semibold text-slate-800">Evidence Verification</span>
+              <span className="font-semibold text-slate-800">
+                Evidence Review
+              </span>
             </div>
 
-            <div className="flex items-center gap-2.5">
-              <span className="font-mono text-xs font-bold bg-teal-50 text-teal-800 border border-teal-200 px-2.5 py-0.5 rounded">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded border border-teal-200 bg-teal-50 px-2.5 py-1 font-mono text-xs font-bold text-teal-800">
                 {activeComplaint.id}
               </span>
               <span className="text-xs text-slate-500">
                 {activeComplaint.ward}
               </span>
             </div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 font-display mt-1 flex items-center gap-2.5">
-              <ShieldCheck className="w-7 h-7 text-[#0D9488]" />
+
+            <h1 className="mt-2 flex items-center gap-2 text-2xl font-bold text-slate-900 sm:text-3xl">
+              <ShieldCheck className="h-7 w-7 text-teal-600" />
               Evidence Verification
             </h1>
+
+            <p className="mt-1 text-sm text-slate-600">
+              {activeComplaint.title} · {activeComplaint.category}
+            </p>
           </div>
 
-          <div className="flex items-center gap-2 self-start sm:self-auto">
-            <span className="bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-bold px-3 py-1 rounded flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-              Ready for Sign-off
-            </span>
-          </div>
+          <span className="self-start rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800 sm:self-auto">
+            Human review required
+          </span>
         </div>
 
-        {/* 2-Column Split: Evidence & Checks (8 cols), Chain of Custody (4 cols) */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          
-          {/* Main Evidence Area (8 cols) */}
-          <div className="lg:col-span-8 space-y-6">
-            
-            {/* Side-by-Side Photo Comparison Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              
-              {/* Before Card */}
-              <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
-                <div className="p-3 border-b border-slate-100 flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-700">Before</span>
-                  <span className="text-[10px] uppercase font-bold bg-red-100 text-red-800 px-2 py-0.5 rounded">
-                    Reported Issue
-                  </span>
-                </div>
-                <div className="h-56 bg-slate-100 relative">
-                  <img
-                    src={activeComplaint.evidence.beforePhotoUrl}
-                    alt="Before repair"
-                    className="w-full h-full object-cover"
-                  />
-                </div>
-                <div className="p-3.5 bg-slate-50 border-t border-slate-100 grid grid-cols-2 gap-2 text-xs">
-                  <div>
-                    <span className="text-[10px] text-slate-400 block uppercase">Date & Time</span>
-                    <span className="font-mono font-semibold text-slate-800">{activeComplaint.evidence.beforeTimestamp || '26 Feb • 08:42 AM'}</span>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block uppercase">Location</span>
-                    <span className="font-mono font-semibold text-slate-800">{activeComplaint.coordinates.lat}° N, {activeComplaint.coordinates.lng}° E</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* After Card */}
-              <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
-                <div className="p-3 border-b border-slate-100 flex items-center justify-between">
-                  <div>
-                    <span className="text-xs font-bold text-slate-700">Repair Submission</span>
-                    <p className="text-[10px] text-slate-500">Post-intervention evidence</p>
-                  </div>
-                  <span className="text-[10px] uppercase font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                    Work Done
-                  </span>
-                </div>
-                <div className="h-56 bg-slate-100 relative">
-                  <img
-                    src={activeComplaint.evidence.afterPhotoUrl || '/src/assets/images/road_repair_completed_bitumen_1792346312012.jpg'}
-                    alt="Work Done"
-                    className="w-full h-full object-cover"
-                  />
-                </div>
-                <div className="p-3.5 bg-slate-50 border-t border-slate-100 grid grid-cols-2 gap-2 text-xs">
-                  <div>
-                    <span className="text-[10px] text-slate-400 block uppercase">Completed</span>
-                    <span className="font-mono font-semibold text-slate-800">{activeComplaint.evidence.afterTimestamp || '28 Feb • 04:15 PM'}</span>
-                  </div>
-                  <div>
-                    <span className="text-[10px] text-slate-400 block uppercase">Team & Offset</span>
-                    <span className="font-mono font-semibold text-emerald-700">Crew Bravo (Δ 11m)</span>
-                  </div>
-                </div>
-              </div>
-
+        {images.demo && (
+          <div className="flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+            <div>
+              <p className="font-semibold">Sample images are being used</p>
+              <p className="mt-1">
+                The available image files do not specifically match this
+                complaint category. These images are placeholders, not proof
+                of the reported issue or completed repair. Do not approve
+                based on these images.
+              </p>
             </div>
+          </div>
+        )}
 
-            {/* Automated Verification Checks Panel (Matches Image 5) */}
-            <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100">
-                <div>
-                  <h3 className="font-display font-bold text-slate-900 text-sm flex items-center gap-2">
-                    <FileCheck className="w-4 h-4 text-[#0D9488]" />
-                    Automated Verification Checks
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Computer vision & metadata checks: Compares distance, timestamp window, and visual curb keypoints between both photos.
-                  </p>
+        <div className="grid grid-cols-1 items-start gap-8 lg:grid-cols-12">
+          <div className="space-y-6 lg:col-span-8">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                <div className="flex items-center justify-between border-b border-slate-100 p-3">
+                  <span className="text-xs font-bold text-slate-700">
+                    Before repair
+                  </span>
+                  <span className="rounded bg-red-100 px-2 py-1 text-[10px] font-bold uppercase text-red-800">
+                    Reported issue
+                  </span>
                 </div>
-                <span className="text-xs font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded shrink-0">
-                  All 4 Checks Passed
-                </span>
+
+                <div className="relative h-56 bg-slate-100">
+                  <img
+                    src={beforeImage}
+                    alt={`Before repair: ${activeComplaint.category}`}
+                    className="h-full w-full object-cover"
+                    onError={(event) => {
+                      event.currentTarget.style.display = 'none';
+                    }}
+                  />
+                  <div className="absolute bottom-2 left-2 flex items-center gap-1 rounded bg-black/70 px-2 py-1 text-xs text-white">
+                    <ImageIcon className="h-3 w-3" />
+                    {images.demo ? 'Sample image' : 'Demo evidence'}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 border-t border-slate-100 bg-slate-50 p-3 text-xs">
+                  <div>
+                    <span className="block text-[10px] uppercase text-slate-400">
+                      Reported at
+                    </span>
+                    <span className="font-semibold text-slate-800">
+                      {evidence?.beforeTimestamp || activeComplaint.reportedAt}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-[10px] uppercase text-slate-400">
+                      Location
+                    </span>
+                    <span className="font-semibold text-slate-800">
+                      {activeComplaint.locationName}
+                    </span>
+                  </div>
+                </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                
-                {/* 1. Location */}
-                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex items-center justify-between">
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                <div className="flex items-center justify-between border-b border-slate-100 p-3">
                   <div>
-                    <span className="text-[10px] font-semibold text-slate-500 uppercase block">Location Match</span>
-                    <span className="font-mono font-bold text-xs text-slate-900">11m Offset</span>
+                    <span className="text-xs font-bold text-slate-700">
+                      After repair
+                    </span>
+                    <p className="text-[10px] text-slate-500">
+                      Submitted repair evidence
+                    </p>
                   </div>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span className="rounded bg-slate-100 px-2 py-1 text-[10px] font-bold uppercase text-slate-700">
+                    Review pending
+                  </span>
                 </div>
 
-                {/* 2. Timeline */}
-                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex items-center justify-between">
-                  <div>
-                    <span className="text-[10px] font-semibold text-slate-500 uppercase block">Timeline</span>
-                    <span className="font-mono font-bold text-xs text-slate-900">48h Elapsed</span>
-                  </div>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                <div className="relative h-56 bg-slate-100">
+                  {evidence?.afterPhotoUrl ? (
+                    <img
+                      src={evidence.afterPhotoUrl}
+                      alt={`Submitted repair: ${activeComplaint.category}`}
+                      className="h-full w-full object-cover"
+                      onError={(event) => {
+                        event.currentTarget.style.display = 'none';
+                      }}
+                    />
+                  ) : (
+                    <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-slate-500">
+                      <ImageIcon className="h-8 w-8" />
+                      No repair photo has been submitted.
+                    </div>
+                  )}
+
+                  {evidence?.afterPhotoUrl && (
+                    <div className="absolute bottom-2 left-2 rounded bg-black/70 px-2 py-1 text-xs text-white">
+                      Submitted image — not yet verified
+                    </div>
+                  )}
                 </div>
 
-                {/* 3. Visual Match */}
-                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex items-center justify-between">
+                <div className="grid grid-cols-2 gap-2 border-t border-slate-100 bg-slate-50 p-3 text-xs">
                   <div>
-                    <span className="text-[10px] font-semibold text-slate-500 uppercase block">Visual Match</span>
-                    <span className="font-bold text-xs text-slate-900">Verified</span>
+                    <span className="block text-[10px] uppercase text-slate-400">
+                      Submitted at
+                    </span>
+                    <span className="font-semibold text-slate-800">
+                      {evidence?.afterTimestamp || 'Not available'}
+                    </span>
                   </div>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                </div>
-
-                {/* 4. Integrity */}
-                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex items-center justify-between">
                   <div>
-                    <span className="text-[10px] font-semibold text-slate-500 uppercase block">Integrity</span>
-                    <span className="font-bold text-xs text-slate-900">Authentic</span>
+                    <span className="block text-[10px] uppercase text-slate-400">
+                      Assigned crew
+                    </span>
+                    <span className="font-semibold text-slate-800">
+                      {activeComplaint.assignedCrew?.name || 'Not assigned'}
+                    </span>
                   </div>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                 </div>
-
-              </div>
-
-              <div className="text-[11px] text-slate-400 text-center pt-1">
-                Demo AI analysis — not a verified authenticity result. Authority engineer human sign-off mandatory.
               </div>
             </div>
 
-            {/* Municipal Ward Authority Sign-off Form */}
-            <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+              <div className="flex items-start gap-3 border-b border-slate-100 pb-3">
+                <FileCheck className="mt-0.5 h-5 w-5 text-teal-600" />
                 <div>
-                  <h3 className="font-display font-bold text-slate-900 text-sm">
-                    Municipal Ward Authority Sign-off
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Mandatory engineer approval memo certifying work quality before marking complaint as fully resolved.
+                  <h2 className="text-sm font-bold text-slate-900">
+                    Evidence review checks
+                  </h2>
+                  <p className="mt-1 text-xs text-slate-500">
+                    These checks require human review. Automated image
+                    authenticity, GPS, timestamp, and visual-comparison checks
+                    are not performed by this screen.
                   </p>
                 </div>
-                <span className="text-[11px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded">
-                  Role: Ward Engineer
-                </span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                  <p className="text-xs font-semibold text-slate-700">
+                    Location information
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {evidence?.beforeCoordinates?.address ||
+                      activeComplaint.locationName}
+                  </p>
+                  <p className="mt-2 text-xs font-medium text-amber-700">
+                    GPS authenticity not verified
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                  <p className="text-xs font-semibold text-slate-700">
+                    Timeline information
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Reported: {activeComplaint.reportedAt}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Updated: {activeComplaint.updatedAt}
+                  </p>
+                  <p className="mt-2 text-xs font-medium text-amber-700">
+                    Photo timestamps not independently verified
+                  </p>
+                </div>
+              </div>
+
+              <p className="rounded-lg bg-slate-50 p-3 text-xs text-slate-600">
+                Demo data may contain sample timestamps, image paths, and
+                coordinates. A stored hash alone cannot prove that a photo is
+                genuine or unedited. Confirm the actual repair before approving.
+              </p>
+            </div>
+
+            <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+              <div className="border-b border-slate-100 pb-3">
+                <h2 className="text-sm font-bold text-slate-900">
+                  Authority inspection and sign-off
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Record your actual inspection findings before making a
+                  decision.
+                </p>
               </div>
 
               <div>
-                <label className="text-xs font-semibold text-slate-700 block mb-1.5">
-                  Inspection Findings & Official Memo
+                <label
+                  htmlFor="inspection-memo"
+                  className="mb-2 block text-xs font-semibold text-slate-700"
+                >
+                  Inspection findings
                 </label>
                 <textarea
-                  rows={3}
+                  id="inspection-memo"
+                  rows={4}
                   value={memo}
-                  onChange={(e) => setMemo(e.target.value)}
-                  className="w-full p-3 bg-slate-50 border border-slate-300 rounded text-xs text-slate-900 focus:outline-none focus:border-[#0D9488]"
+                  onChange={(event) => setMemo(event.target.value)}
+                  placeholder="Enter the inspection findings and any work that remains..."
+                  className="w-full rounded-lg border border-slate-300 bg-slate-50 p-3 text-sm text-slate-900 focus:border-teal-600 focus:outline-none"
                 />
               </div>
 
-              <div className="flex flex-wrap items-center gap-4 text-xs pt-1">
-                <label className="flex items-center gap-2 cursor-pointer">
+              <div className="space-y-3 border-t border-slate-100 pt-3">
+                <label className="flex cursor-pointer items-start gap-3 text-xs text-slate-700">
                   <input
                     type="checkbox"
-                    checked={curbCheck}
-                    onChange={(e) => setCurbCheck(e.target.checked)}
-                    className="w-4 h-4 text-[#0D9488] rounded"
+                    checked={detailsReviewed}
+                    onChange={(event) =>
+                      setDetailsReviewed(event.target.checked)
+                    }
+                    className="mt-0.5 h-4 w-4 accent-teal-600"
                   />
-                  <span className="text-slate-700">Curb alignment matches report</span>
+                  <span>
+                    I reviewed the complaint details and confirmed that the
+                    evidence relates to the reported issue.
+                  </span>
                 </label>
-                <label className="flex items-center gap-2 cursor-pointer">
+
+                <label className="flex cursor-pointer items-start gap-3 text-xs text-slate-700">
                   <input
                     type="checkbox"
-                    checked={barricadeCheck}
-                    onChange={(e) => setBarricadeCheck(e.target.checked)}
-                    className="w-4 h-4 text-[#0D9488] rounded"
+                    checked={repairReviewed}
+                    onChange={(event) =>
+                      setRepairReviewed(event.target.checked)
+                    }
+                    className="mt-0.5 h-4 w-4 accent-teal-600"
                   />
-                  <span className="text-slate-700">Safety barricades deployed properly</span>
+                  <span>
+                    I reviewed the repair evidence and have independently
+                    confirmed the repair status.
+                  </span>
                 </label>
               </div>
 
-              <div className="flex flex-col sm:flex-row items-center gap-3 pt-3 border-t border-slate-100">
+              <div className="flex flex-col gap-3 border-t border-slate-100 pt-4 sm:flex-row sm:flex-wrap">
                 <button
                   type="button"
                   disabled={processing}
                   onClick={() => handleDecision('approve')}
-                  className="w-full sm:flex-1 py-2.5 bg-[#0D9488] hover:bg-[#0F766E] disabled:bg-slate-400 text-white font-semibold text-xs rounded transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-sm"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-teal-600 px-4 py-3 text-xs font-semibold text-white transition-colors hover:bg-teal-700 disabled:cursor-not-allowed disabled:bg-slate-400"
                 >
-                  <Check className="w-4 h-4" />
-                  Approve Resolution
+                  <Check className="h-4 w-4" />
+                  {processing ? 'Processing...' : 'Approve resolution'}
                 </button>
 
                 <button
                   type="button"
                   disabled={processing}
                   onClick={() => handleDecision('flag')}
-                  className="w-full sm:w-auto px-4 py-2.5 border border-amber-300 hover:bg-amber-50 text-amber-800 font-semibold text-xs rounded transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  className="flex items-center justify-center gap-2 rounded-lg border border-amber-300 px-4 py-3 text-xs font-semibold text-amber-800 hover:bg-amber-50 disabled:opacity-50"
                 >
-                  <Flag className="w-3.5 h-3.5" />
-                  Flag for Audit
+                  <Flag className="h-4 w-4" />
+                  Flag for audit
                 </button>
 
                 <button
                   type="button"
                   disabled={processing}
                   onClick={() => handleDecision('reject')}
-                  className="w-full sm:w-auto px-4 py-2.5 border border-red-300 hover:bg-red-50 text-red-700 font-semibold text-xs rounded transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                  className="flex items-center justify-center gap-2 rounded-lg border border-red-300 px-4 py-3 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
                 >
-                  <X className="w-3.5 h-3.5" />
+                  <X className="h-4 w-4" />
                   Reject
                 </button>
               </div>
             </div>
-
           </div>
 
-          {/* Right: Evidence Chain of Custody Sidebar (Matches Image 5) (4 cols) */}
-          <div className="lg:col-span-4 bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-6">
-            <h3 className="font-display font-bold text-slate-900 text-sm flex items-center gap-2">
-              <Clock className="w-4 h-4 text-slate-500" />
-              Evidence Chain of Custody
-            </h3>
+          <aside className="space-y-5 rounded-xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-4">
+            <h2 className="flex items-center gap-2 text-sm font-bold text-slate-900">
+              <Clock className="h-4 w-4 text-slate-500" />
+              Complaint record
+            </h2>
 
-            <div className="space-y-5 text-xs relative pl-4 border-l-2 border-slate-200 ml-2">
-              
-              {/* Event 1 */}
-              <div className="relative">
-                <div className="absolute -left-[21px] top-0 w-3 h-3 rounded-full bg-slate-900" />
-                <span className="font-mono text-[10px] text-slate-400 block">26 Feb • 08:42</span>
-                <h4 className="font-bold text-slate-900 mt-0.5">Incident Reported</h4>
-                <p className="text-slate-500 text-[11px] mt-0.5">Citizen Ananya S. uploaded photo</p>
+            <div className="space-y-4 text-xs">
+              <div>
+                <p className="text-slate-400">Complaint ID</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.id}
+                </p>
               </div>
 
-              {/* Event 2 */}
-              <div className="relative">
-                <div className="absolute -left-[21px] top-0 w-3 h-3 rounded-full bg-slate-900" />
-                <span className="font-mono text-[10px] text-slate-400 block">27 Feb • 10:00</span>
-                <h4 className="font-bold text-slate-900 mt-0.5">Work Order Dispatched</h4>
-                <p className="text-slate-500 text-[11px] mt-0.5">Assigned to Crew Bravo (Indiranagar Unit)</p>
+              <div>
+                <p className="text-slate-400">Category</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.category}
+                </p>
               </div>
 
-              {/* Event 3 */}
-              <div className="relative">
-                <div className="absolute -left-[21px] top-0 w-3 h-3 rounded-full bg-slate-900" />
-                <span className="font-mono text-[10px] text-slate-400 block">28 Feb • 16:30</span>
-                <h4 className="font-bold text-slate-900 mt-0.5">Repair Evidence Uploaded</h4>
-                <p className="text-slate-500 text-[11px] mt-0.5">Submitted by Supervisor S. Patil</p>
+              <div>
+                <p className="text-slate-400">Severity</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.severity}
+                </p>
               </div>
 
-              {/* Event 4 */}
-              <div className="relative">
-                <div className="absolute -left-[21px] top-0 w-3 h-3 rounded-full bg-emerald-500" />
-                <span className="font-mono text-[10px] text-slate-400 block">28 Feb • 16:45</span>
-                <h4 className="font-bold text-slate-900 mt-0.5">EvidenceGuard Passed</h4>
-                <p className="text-emerald-700 text-[11px] font-semibold mt-0.5">Automated checks clearance 91%</p>
+              <div>
+                <p className="text-slate-400">Current status</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.status}
+                </p>
               </div>
 
-              {/* Event 5 (Current) */}
-              <div className="relative">
-                <div className="absolute -left-[21px] top-0 w-3 h-3 rounded-full bg-amber-500 animate-ping" />
-                <div className="absolute -left-[21px] top-0 w-3 h-3 rounded-full bg-amber-500" />
-                <span className="font-mono text-[10px] text-amber-600 font-bold block uppercase">Current Stage</span>
-                <h4 className="font-bold text-slate-900 mt-0.5">Pending Engineer Sign-off</h4>
-                <p className="text-slate-500 text-[11px] mt-0.5">Awaiting action click above</p>
+              <div>
+                <p className="text-slate-400">Location</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.locationName}
+                </p>
               </div>
 
+              <div>
+                <p className="text-slate-400">Reported at</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.reportedAt}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-slate-400">Last updated</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.updatedAt}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-slate-400">Assigned crew</p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {activeComplaint.assignedCrew?.name || 'Not assigned'}
+                </p>
+              </div>
             </div>
 
-            <div className="pt-4 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
-              <span className="font-semibold text-slate-700">Evidence Audit Trail</span>
-              <span className="flex items-center gap-1 text-emerald-700 font-semibold text-[11px]">
-                <Lock className="w-3 h-3" />
-                Verified
-              </span>
+            <div className="border-t border-slate-100 pt-4">
+              <div className="flex items-center gap-2 text-xs font-semibold text-amber-800">
+                <Lock className="h-4 w-4" />
+                Awaiting human review
+              </div>
+              <p className="mt-2 text-xs leading-5 text-slate-500">
+                The complaint record and sample evidence are displayed for
+                review. This screen does not establish an immutable audit
+                trail or independently verify image authenticity.
+              </p>
             </div>
-          </div>
-
+          </aside>
         </div>
-
       </div>
     </div>
   );

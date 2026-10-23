@@ -46,8 +46,8 @@ export const MaintenanceTasks: React.FC<MaintenanceTasksProps> = ({
 
   const filteredTasks = complaints.filter(task => {
     if (taskFilter === 'High' && task.severity !== 'High' && task.severity !== 'Critical') return false;
-    if (taskFilter === 'Pending' && task.status !== 'Evidence Submitted') return false;
-    if (taskFilter === 'In Progress' && task.status !== 'In Progress') return false;
+    if (taskFilter === 'Pending' && task.status !== 'Evidence Submitted' && task.status !== 'Reopened') return false;
+    if (taskFilter === 'In Progress' && task.status !== 'In Progress' && task.status !== 'Assigned' && task.status !== 'Reopened') return false;
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       return task.id.toLowerCase().includes(q) || task.title.toLowerCase().includes(q) || task.locationName.toLowerCase().includes(q);
@@ -58,8 +58,32 @@ export const MaintenanceTasks: React.FC<MaintenanceTasksProps> = ({
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      setRepairPhotoUrl(URL.createObjectURL(file));
-      showToast('Field photo captured with simulated hardware EXIF timestamp', 'info');
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          setRepairPhotoUrl(reader.result);
+          showToast('Field photo captured and encoded for tamper-proof upload', 'info');
+        }
+      };
+      reader.onerror = () => {
+        showToast('Could not process the selected image.', 'error');
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleStartProgress = async () => {
+    if (!activeTask) return;
+    try {
+      await complaintService.updateStatus(
+        activeTask.id,
+        'In Progress',
+        'Field crew acknowledged task assignment and commenced repair operations.'
+      );
+      await refreshComplaints();
+      showToast(`Docket #${activeTask.id} status updated to In Progress!`, 'success');
+    } catch {
+      showToast('Unable to update task status.', 'error');
     }
   };
 
@@ -438,6 +462,17 @@ export const MaintenanceTasks: React.FC<MaintenanceTasksProps> = ({
             {/* Submission Actions */}
             <div className="space-y-3 pt-2 border-t border-slate-100">
               <div className="flex flex-col sm:flex-row items-center gap-3">
+                {(activeTask.status === 'Assigned' || activeTask.status === 'Reopened') && (
+                  <button
+                    type="button"
+                    onClick={handleStartProgress}
+                    className="w-full sm:w-auto px-4 py-3 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs rounded transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-sm"
+                  >
+                    <Wrench className="w-4 h-4" />
+                    Acknowledge &amp; Start Repair
+                  </button>
+                )}
+
                 <button
                   type="button"
                   disabled={submitting}

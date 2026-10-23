@@ -54,12 +54,26 @@ export const CitizenFeedback: React.FC<CitizenFeedbackProps> = ({
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      setCitizenPhotoUrl(URL.createObjectURL(file));
-      showToast('Citizen verification photo staged with simulated EXIF stamp', 'info');
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          setCitizenPhotoUrl(reader.result);
+          showToast('Citizen verification photo uploaded and attached', 'info');
+        }
+      };
+      reader.onerror = () => {
+        showToast('Could not process verification photo', 'error');
+      };
+      reader.readAsDataURL(file);
     }
   };
 
   const handleSubmitFeedback = async (isReopenRequest: boolean = false) => {
+    if (!targetComplaint) {
+      showToast('No complaint selected for feedback.', 'error');
+      return;
+    }
+
     setSubmitting(true);
     try {
       const payload: CitizenFeedbackData = {
@@ -72,7 +86,7 @@ export const CitizenFeedback: React.FC<CitizenFeedbackProps> = ({
         testimonialText: isReopenRequest ? `Re-inspection requested: ${testimonialText}` : testimonialText,
         publishPublicly,
         nominateCrew: isReopenRequest ? false : nominateCrew,
-        submittedAt: new Date().toLocaleString('en-IN')
+        submittedAt: new Date().toISOString()
       };
 
       await complaintService.submitFeedback(targetComplaint.id, payload);

@@ -117,6 +117,15 @@ export const authService = {
     });
   },
 
+  async demoLogin(role: UserRole): Promise<UserProfile> {
+    const data = await request<AuthResponse>('/auth/demo-login', {
+      method: 'POST',
+      body: JSON.stringify({ role }),
+    });
+
+    return extractUser(data);
+  },
+
   switchRole(_role: UserRole): UserProfile {
     throw new Error(
       'Role switching is disabled. Sign in using an authorized account.'

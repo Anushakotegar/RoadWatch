@@ -1,4 +1,3 @@
-
 import {
   INITIAL_COMPLAINTS,
   DEMO_STATISTICS,
@@ -14,6 +13,14 @@ import type {
 
 const API_BASE_URL = '/api';
 const STORAGE_KEY = 'roadwatch_complaints_v1';
+
+interface ApiResponse<T> {
+  success?: boolean;
+  message?: string;
+  error?: string;
+  complaints?: T[];
+  complaint?: T;
+}
 
 function getStoredComplaints(): Complaint[] {
   try {
@@ -58,15 +65,20 @@ async function apiRequest<T>(
     );
   }
 
-  const data = await response.json().catch(() => null);
+  const data = (await response.json().catch(() => null)) as
+    | ApiResponse<T>
+    | null;
 
   if (!response.ok) {
-    const message =
-      data && typeof data.error === 'string'
-        ? data.error
-        : `Request failed (${response.status}).`;
+    throw new Error(
+      data?.message ||
+        data?.error ||
+        `Request failed (${response.status}).`,
+    );
+  }
 
-    throw new Error(message);
+  if (!data || typeof data !== 'object') {
+    throw new Error('The server returned an invalid response.');
   }
 
   return data as T;
@@ -118,7 +130,9 @@ function matchesFilter(
       complaint.locationName,
       complaint.category,
       complaint.ward,
-    ].join(' ').toLowerCase();
+    ]
+      .join(' ')
+      .toLowerCase();
 
     if (!searchableText.includes(query)) return false;
   }
@@ -159,47 +173,32 @@ export const complaintService = {
     ward?: string;
     search?: string;
   }): Promise<Complaint[]> {
-    const params = new URLSearchParams();
+    const response = await apiRequest<ApiResponse<Complaint>>(
+      '/complaints',
+    );
 
-    if (filter?.category && filter.category !== 'All') {
-      params.set('category', filter.category);
-    }
-
-    if (filter?.status && filter.status !== 'All') {
-      params.set('status', filter.status);
-    }
-
-    if (
-      filter?.ward &&
-      filter.ward !== 'All Wards' &&
-      !filter.ward.includes('All')
-    ) {
-      params.set('ward', filter.ward);
-    }
-
-    if (filter?.search?.trim()) {
-      params.set('search', filter.search.trim());
-    }
-
-    const query = params.toString();
-    const path = query ? `/complaints?${query}` : '/complaints';
-
-    const complaints = await apiRequest<Complaint[]>(path);
-
-    if (!Array.isArray(complaints)) {
+    if (!Array.isArray(response.complaints)) {
       throw new Error(
         'The server returned an unexpected complaints response.',
       );
     }
 
-    return complaints.filter((complaint) => matchesFilter(complaint, filter));
+    return response.complaints.filter((complaint) =>
+      matchesFilter(complaint, filter),
+    );
   },
 
   async getComplaintById(id: string): Promise<Complaint | null> {
     try {
-      return await apiRequest<Complaint>(
+      const response = await apiRequest<ApiResponse<Complaint>>(
         `/complaints/${encodeURIComponent(id.trim())}`,
       );
+
+      if (!response.complaint) {
+        throw new Error('The server returned an invalid complaint response.');
+      }
+
+      return response.complaint;
     } catch (error) {
       if (
         error instanceof Error &&
@@ -223,29 +222,52 @@ export const complaintService = {
       | 'commentsCount'
     >,
   ): Promise<Complaint> {
-    return apiRequest<Complaint>('/complaints', {
-      method: 'POST',
-      body: JSON.stringify({
-        title: payload.title,
-        description: payload.description,
-        ward: payload.ward,
-        locationName: payload.locationName,
-        category: payload.category,
-        severity: payload.severity,
-        coordinates: payload.coordinates,
-        evidence: payload.evidence,
-      }),
-    });
-  },
+    const response = await apiRequest<ApiResponse<Complaint>>(
+      '/complaints',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          title: payload.title,
+          description: payload.description,
+          ward: payload.ward,
+          locationName: payload.locationName,
+          category: payload.category,
+          severity: payload.severity,
+          coordinates: payload.coordinates,
+          citizenPhoneMasked: payload.citizenPhoneMasked,
+          evidence: payload.evidence,
+        }),
+      },
+    );
 
-  // These operations still use local demo storage.
-  // Their backend endpoints have not been implemented yet.
+    if (!response.complaint) {
+      throw new Error(
+        response.message || 'The server did not return the created complaint.',
+      );
+    }
+
+    return response.complaint;
+  },
 
   async updateStatus(
     id: string,
     status: ComplaintStatus,
     note?: string,
   ): Promise<Complaint | null> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/status`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ status, note }),
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated;
+    } catch (error) {
+      console.warn('Backend updateStatus failed, falling back to local state:', error);
+    }
+
     const { list, index } = findStoredComplaint(id);
     if (index === -1) return null;
 
@@ -279,7 +301,22 @@ export const complaintService = {
   async assignCrew(
     id: string,
     crew: NonNullable<Complaint['assignedCrew']>,
+    note?: string,
   ): Promise<Complaint | null> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/crew`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ assignedCrew: crew, note }),
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated;
+    } catch (error) {
+      console.warn('Backend assignCrew failed, falling back to local state:', error);
+    }
+
     const { list, index } = findStoredComplaint(id);
     if (index === -1) return null;
 
@@ -313,6 +350,20 @@ export const complaintService = {
     evidenceData: Partial<EvidenceRecord>,
     notes?: string,
   ): Promise<Complaint | null> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/evidence`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ evidence: evidenceData, note: notes }),
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated;
+    } catch (error) {
+      console.warn('Backend submitEvidence failed, falling back to local state:', error);
+    }
+
     const { list, index } = findStoredComplaint(id);
     if (index === -1) return null;
 
@@ -353,6 +404,20 @@ export const complaintService = {
     decision: 'approve' | 'flag' | 'reject',
     memo: string,
   ): Promise<Complaint | null> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/evidence-review`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ decision, note: memo }),
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated;
+    } catch (error) {
+      console.warn('Backend reviewEvidence failed, falling back to local state:', error);
+    }
+
     const statusMap: Record<string, ComplaintStatus> = {
       approve: 'Resolved',
       flag: 'Flagged for Audit',
@@ -370,6 +435,20 @@ export const complaintService = {
     id: string,
     feedback: CitizenFeedbackData,
   ): Promise<Complaint | null> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/feedback`,
+        {
+          method: 'POST',
+          body: JSON.stringify(feedback),
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated;
+    } catch (error) {
+      console.warn('Backend submitFeedback failed, falling back to local state:', error);
+    }
+
     const { list, index } = findStoredComplaint(id);
     if (index === -1) return null;
 
@@ -377,7 +456,9 @@ export const complaintService = {
     const now = formatLocalTime();
 
     const newStatus: ComplaintStatus =
-      feedback.resolutionStatus === 'not_repaired' ? 'Reopened' : 'Resolved';
+      feedback.resolutionStatus === 'not_repaired'
+        ? 'Reopened'
+        : 'Resolved';
 
     const updatedRecord: Complaint = {
       ...current,
@@ -404,6 +485,19 @@ export const complaintService = {
   },
 
   async endorseComplaint(id: string): Promise<number> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/endorse`,
+        {
+          method: 'POST',
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated.endorsementsCount;
+    } catch (error) {
+      console.warn('Backend endorseComplaint failed, falling back to local state:', error);
+    }
+
     const { list, index } = findStoredComplaint(id);
     if (index === -1) return 0;
 
@@ -418,6 +512,20 @@ export const complaintService = {
     author: string,
     role: string,
   ): Promise<Complaint | null> {
+    try {
+      await apiRequest<ApiResponse<Complaint>>(
+        `/complaints/${encodeURIComponent(id.trim())}/comments`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ text }),
+        },
+      );
+      const updated = await this.getComplaintById(id);
+      if (updated) return updated;
+    } catch (error) {
+      console.warn('Backend addComment failed, falling back to local state:', error);
+    }
+
     const { list, index } = findStoredComplaint(id);
     if (index === -1) return null;
 
