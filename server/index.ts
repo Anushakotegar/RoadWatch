@@ -42,6 +42,7 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3001',
   'http://127.0.0.1:3002',
+  'https://roadwatch-web-9izo.onrender.com',
 ];
 
 interface PublicUser {
