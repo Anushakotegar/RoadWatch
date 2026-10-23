@@ -39,6 +39,7 @@ type DashboardComplaint = {
 const ACTIVE_STATUSES = [
   'Submitted',
   'Under Review',
+  'Assigned',
   'In Progress',
   'Evidence Submitted',
   'Awaiting Verification',
