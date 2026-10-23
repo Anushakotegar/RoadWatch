@@ -39,23 +39,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
 }) => {
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [complaints, setComplaints] = useState<Complaint[]>([]);
-  const [loadingComplaints, setLoadingComplaints] = useState<boolean>(true);
+  const [loadingComplaints, setLoadingComplaints] = useState(true);
   const [selectedComplaintId, setSelectedComplaintId] = useState<string | null>(
-    'RW-2025-8492'
+    'RW-2025-8492',
   );
   const [toasts, setToasts] = useState<ToastState[]>([]);
-  const [activeNavTab, setActiveNavTab] = useState<string>('sign-in');
+  const [activeNavTab, setActiveNavTab] = useState('sign-in');
 
   const showToast = useCallback(
     (message: string, type: 'success' | 'error' | 'info' = 'success') => {
       const id = Date.now();
+
       setToasts((previous) => [...previous, { id, message, type }]);
 
       setTimeout(() => {
-        setToasts((previous) => previous.filter((toast) => toast.id !== id));
+        setToasts((previous) =>
+          previous.filter((toast) => toast.id !== id),
+        );
       }, 4500);
     },
-    []
+    [],
   );
 
   const refreshComplaints = useCallback(async () => {
@@ -66,12 +69,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
       setComplaints(data);
     } catch (error) {
       console.error('Failed to load complaints:', error);
+      showToast('Unable to refresh reports from the server.', 'error');
     } finally {
       setLoadingComplaints(false);
     }
-  }, []);
+  }, [showToast]);
 
-  // Restore the authenticated user from the backend session on page load.
+  // Restore the user's authenticated session.
   useEffect(() => {
     let cancelled = false;
 
@@ -84,15 +88,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
         setCurrentUser(user);
 
         if (user) {
-          if (user.role === 'citizen') {
-            setActiveNavTab('citizen-dashboard');
-          } else if (user.role === 'authority') {
-            setActiveNavTab('authority');
-          } else if (user.role === 'field_crew') {
-            setActiveNavTab('field-team');
-          } else if (user.role === 'admin') {
-            setActiveNavTab('admin');
-          }
+          const workspaceByRole: Record<UserRole, string> = {
+            citizen: 'citizen-dashboard',
+            authority: 'authority',
+            field_crew: 'field-team',
+            admin: 'admin',
+          };
+
+          setActiveNavTab(workspaceByRole[user.role] || 'citizen-dashboard');
         } else {
           setActiveNavTab('sign-in');
         }
@@ -102,9 +105,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
         console.error('Failed to restore authentication session:', error);
         setCurrentUser(null);
         setActiveNavTab('sign-in');
+
         showToast(
-          'Unable to connect to the authentication server. Please check that the backend is running.',
-          'error'
+          'Unable to restore your session. Please check the backend connection.',
+          'error',
         );
       }
     };
@@ -116,16 +120,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
     };
   }, [showToast]);
 
-  // Load public complaint data.
+  // Reload complaints whenever the authenticated user changes.
+  // This refreshes the dashboard after login and session restoration.
   useEffect(() => {
     void refreshComplaints();
-  }, [refreshComplaints]);
+  }, [refreshComplaints, currentUser?.id]);
 
-  // Switch demonstration roles for judges and prototype demonstration
   const switchRole = useCallback(
     async (role: UserRole) => {
       try {
         const user = await authService.demoLogin(role);
+
         setCurrentUser(user);
 
         const workspaceByRole: Record<UserRole, string> = {
@@ -135,26 +140,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
           admin: 'admin',
         };
 
-        const targetTab = workspaceByRole[user.role] || 'citizen-dashboard';
-        setActiveNavTab(targetTab);
+        setActiveNavTab(workspaceByRole[user.role] || 'citizen-dashboard');
+
         showToast(
-          `Switched active session to demo ${user.role}: ${user.name}`,
-          'success'
+          `Switched to demonstration ${user.role}: ${user.name}`,
+          'success',
         );
       } catch (error) {
         showToast(
           error instanceof Error
             ? error.message
             : `Unable to switch to demonstration ${role} account.`,
-          'error'
+          'error',
         );
       }
     },
-    [showToast, setActiveNavTab]
+    [showToast],
   );
 
   const dismissToast = useCallback((id: number) => {
-    setToasts((previous) => previous.filter((toast) => toast.id !== id));
+    setToasts((previous) =>
+      previous.filter((toast) => toast.id !== id),
+    );
   }, []);
 
   return (
